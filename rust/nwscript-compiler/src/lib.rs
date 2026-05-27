@@ -8,3 +8,4 @@ pub mod parser;
 pub mod semcheck;
 pub mod compiler;
 pub mod codegen;
+pub mod wasm;
