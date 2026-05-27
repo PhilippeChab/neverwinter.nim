@@ -9,4 +9,6 @@ pub mod semcheck;
 pub mod compiler;
 pub mod codegen;
 pub mod resources;
+pub mod optimize;
+pub mod ndb;
 pub mod wasm;

@@ -4,6 +4,8 @@ use crate::ast::{AstArena, NodeId, NULL_NODE, Operation};
 use crate::codegen::CodeGenerator;
 use crate::errors::{CompileError, Diagnostic};
 use crate::lexer::Lexer;
+use crate::ndb::NdbBuilder;
+use crate::optimize;
 use crate::parser::Parser;
 use crate::semcheck::SemanticChecker;
 
@@ -188,15 +190,28 @@ impl Compiler {
         codegen.set_collect_all_errors(self.options.collect_all_errors);
         codegen.load_symbols(&checker);
         match codegen.generate(main_parsed.root) {
-            Ok(ncs) => {
+            Ok(mut ncs) => {
                 all_diagnostics.extend(codegen.diagnostics);
                 let has_errors = all_diagnostics
                     .iter()
                     .any(|d| d.error != CompileError::AlreadyPrinted);
+
+                // Optimization pass
+                optimize::optimize_ncs(&mut ncs, self.options.optimization_level);
+
+                // NDB debug output
+                let ndb = if self.options.generate_debug {
+                    let mut builder = NdbBuilder::new();
+                    builder.add_file(filename);
+                    builder.generate()
+                } else {
+                    Vec::new()
+                };
+
                 CompileResult {
                     success: !has_errors,
                     ncs,
-                    ndb: Vec::new(),
+                    ndb,
                     diagnostics: all_diagnostics,
                 }
             }
