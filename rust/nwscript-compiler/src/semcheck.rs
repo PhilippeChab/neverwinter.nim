@@ -2,6 +2,30 @@ use crate::ast::{AstArena, AstNode, NodeId, NULL_NODE, Operation};
 use crate::errors::{CompileError, Diagnostic};
 use crate::types::NwType;
 
+fn preprocess_lang_spec(spec: &str) -> String {
+    let mut result = Vec::new();
+
+    for line in spec.lines() {
+        let trimmed = line.trim();
+
+        // Skip #define directives
+        if trimmed.starts_with("#define") {
+            continue;
+        }
+
+        // Skip empty lines and comments
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+
+        // Keep function declarations (lines with parentheses that end with ;)
+        // Keep global constant/variable declarations (type name = value;)
+        result.push(line);
+    }
+
+    result.join("\n")
+}
+
 #[derive(Debug, Clone)]
 pub struct FunctionSig {
     pub name: String,
@@ -91,10 +115,17 @@ impl<'a> SemanticChecker<'a> {
     }
 
     pub fn load_lang_spec(&mut self, spec: &str) {
-        let mut lexer = crate::lexer::Lexer::new(spec, "nwscript.nss", 0);
+        // The nwscript.nss lang spec contains #define directives and global
+        // variable constants that our parser doesn't handle. Preprocess to
+        // extract only function declarations and global constants.
+        let cleaned = preprocess_lang_spec(spec);
+
+        let mut lexer = crate::lexer::Lexer::new(&cleaned, "nwscript.nss", 0);
         let tokens = lexer.tokenize();
         let mut parser = crate::parser::Parser::new(tokens);
         parser.file_names.push("nwscript.nss".to_string());
+        parser.set_collect_all_errors(true);
+        parser.set_require_entry_point(false);
         if let Ok(root) = parser.parse_program() {
             self.collect_from_arena(root, &parser.arena);
         }
@@ -117,45 +148,48 @@ impl<'a> SemanticChecker<'a> {
         self.diagnostics.extend(sub.diagnostics);
     }
 
-    fn collect_from_arena(&mut self, node_id: NodeId, arena: &AstArena) {
-        if node_id == NULL_NODE {
-            return;
-        }
-        let node = arena.get(node_id).clone();
+    fn collect_from_arena(&mut self, root: NodeId, arena: &AstArena) {
+        // Iterative walk to avoid stack overflow on large files (nwscript.nss has 6000+ declarations)
+        let mut stack = vec![root];
+        while let Some(node_id) = stack.pop() {
+            if node_id == NULL_NODE { continue; }
+            let node = arena.get(node_id).clone();
 
-        match node.op {
-            Operation::FunctionalUnit => {
-                self.collect_from_arena(node.left, arena);
-                self.collect_from_arena(node.right, arena);
-            }
-            Operation::FunctionDeclaration => {
-                self.register_func_from_arena(node.left, false, arena);
-            }
-            Operation::Function => {
-                self.register_func_from_arena(node.left, true, arena);
-            }
-            Operation::KeywordStruct => {
-                if node.left != NULL_NODE {
-                    let def = arena.get(node.left).clone();
-                    if def.op == Operation::StructureDefinition {
-                        self.register_struct_from_arena(&def, arena);
+            match node.op {
+                Operation::FunctionalUnit => {
+                    // Push right first so left is processed first
+                    if node.right != NULL_NODE { stack.push(node.right); }
+                    if node.left != NULL_NODE { stack.push(node.left); }
+                }
+                Operation::FunctionDeclaration => {
+                    self.register_func_from_arena(node.left, false, arena);
+                }
+                Operation::Function => {
+                    self.register_func_from_arena(node.left, true, arena);
+                }
+                Operation::KeywordStruct => {
+                    if node.left != NULL_NODE {
+                        let def = arena.get(node.left).clone();
+                        if def.op == Operation::StructureDefinition {
+                            self.register_struct_from_arena(&def, arena);
+                        }
                     }
                 }
+                Operation::GlobalVariables => {
+                    self.register_global_from_arena(&node, arena);
+                }
+                Operation::ConstDeclaration => {
+                    let name = node.string_data.as_deref().unwrap_or("").to_string();
+                    self.globals.push(VarEntry {
+                        name,
+                        nw_type: node.nw_type,
+                        type_name: node.type_name.clone(),
+                        scope_level: 0,
+                        is_constant: true,
+                    });
+                }
+                _ => {}
             }
-            Operation::GlobalVariables => {
-                self.register_global_from_arena(&node, arena);
-            }
-            Operation::ConstDeclaration => {
-                let name = node.string_data.as_deref().unwrap_or("").to_string();
-                self.globals.push(VarEntry {
-                    name,
-                    nw_type: node.nw_type,
-                    type_name: node.type_name.clone(),
-                    scope_level: 0,
-                    is_constant: true,
-                });
-            }
-            _ => {}
         }
     }
 
@@ -337,38 +371,39 @@ impl<'a> SemanticChecker<'a> {
         Ok(())
     }
 
-    fn collect_pass(&mut self, node_id: NodeId) {
-        if node_id == NULL_NODE {
-            return;
-        }
-        let node = self.arena.get(node_id).clone();
+    fn collect_pass(&mut self, root: NodeId) {
+        let mut stack = vec![root];
+        while let Some(node_id) = stack.pop() {
+            if node_id == NULL_NODE { continue; }
+            let node = self.arena.get(node_id).clone();
 
-        match node.op {
-            Operation::FunctionalUnit => {
-                self.collect_pass(node.left);
-                self.collect_pass(node.right);
-            }
-            Operation::KeywordStruct => {
-                if node.left != NULL_NODE {
-                    let def = self.arena.get(node.left).clone();
-                    if def.op == Operation::StructureDefinition {
-                        self.register_struct(&def);
+            match node.op {
+                Operation::FunctionalUnit => {
+                    if node.right != NULL_NODE { stack.push(node.right); }
+                    if node.left != NULL_NODE { stack.push(node.left); }
+                }
+                Operation::KeywordStruct => {
+                    if node.left != NULL_NODE {
+                        let def = self.arena.get(node.left).clone();
+                        if def.op == Operation::StructureDefinition {
+                            self.register_struct(&def);
+                        }
                     }
                 }
+                Operation::FunctionDeclaration => {
+                    self.register_func_decl(node.left, false);
+                }
+                Operation::Function => {
+                    self.register_func_decl(node.left, true);
+                }
+                Operation::GlobalVariables => {
+                    self.register_global(&node);
+                }
+                Operation::ConstDeclaration => {
+                    self.register_const_global(&node);
+                }
+                _ => {}
             }
-            Operation::FunctionDeclaration => {
-                self.register_func_decl(node.left, false);
-            }
-            Operation::Function => {
-                self.register_func_decl(node.left, true);
-            }
-            Operation::GlobalVariables => {
-                self.register_global(&node);
-            }
-            Operation::ConstDeclaration => {
-                self.register_const_global(&node);
-            }
-            _ => {}
         }
     }
 
@@ -488,29 +523,27 @@ impl<'a> SemanticChecker<'a> {
         });
     }
 
-    fn check_pass(&mut self, node_id: NodeId) -> Result<(), CompileError> {
-        if node_id == NULL_NODE {
-            return Ok(());
-        }
-        let node = self.arena.get(node_id).clone();
+    fn check_pass(&mut self, root: NodeId) -> Result<(), CompileError> {
+        let mut stack = vec![root];
+        while let Some(node_id) = stack.pop() {
+            if node_id == NULL_NODE { continue; }
+            let node = self.arena.get(node_id).clone();
 
-        match node.op {
-            Operation::FunctionalUnit => {
-                self.check_pass(node.left)?;
-                self.check_pass(node.right)?;
+            match node.op {
+                Operation::FunctionalUnit => {
+                    if node.right != NULL_NODE { stack.push(node.right); }
+                    if node.left != NULL_NODE { stack.push(node.left); }
+                }
+                Operation::Function => {
+                    self.check_function(node_id)?;
+                }
+                Operation::FunctionDeclaration
+                | Operation::KeywordStruct
+                | Operation::GlobalVariables
+                | Operation::ConstDeclaration => {}
+                _ => {}
             }
-            Operation::Function => {
-                self.check_function(node_id)?;
-            }
-            Operation::FunctionDeclaration
-            | Operation::KeywordStruct
-            | Operation::GlobalVariables
-            | Operation::ConstDeclaration => {
-                // Already handled in collect pass
-            }
-            _ => {}
         }
-
         Ok(())
     }
 
