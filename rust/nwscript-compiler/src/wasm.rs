@@ -1,8 +1,21 @@
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 
+use crate::ast::{AstArena, NodeId, NULL_NODE};
+use crate::astquery::{self, PositionQuery};
 use crate::compiler::{Compiler, CompilerOptions, FileResolver};
 use crate::errors::Diagnostic;
+use crate::lexer::Lexer;
+use crate::parser::Parser;
+use crate::semcheck::{FunctionSig, SemanticChecker, StructDef};
+
+struct ParsedState {
+    arena: AstArena,
+    root: NodeId,
+    file_names: Vec<String>,
+    functions: Vec<FunctionSig>,
+    structs: Vec<StructDef>,
+}
 
 #[wasm_bindgen]
 pub struct WasmCompiler {
@@ -11,6 +24,7 @@ pub struct WasmCompiler {
     last_diagnostics: Vec<Diagnostic>,
     last_error: String,
     last_ncs: Option<Vec<u8>>,
+    last_parse: Option<ParsedState>,
     require_entry_point: bool,
     collect_all_errors: bool,
 }
@@ -25,6 +39,7 @@ impl WasmCompiler {
             last_diagnostics: Vec::new(),
             last_error: String::new(),
             last_ncs: None,
+            last_parse: None,
             require_entry_point: true,
             collect_all_errors: false,
         }
@@ -69,6 +84,7 @@ impl WasmCompiler {
                     filename, filename
                 );
                 self.last_diagnostics.clear();
+                self.last_parse = None;
                 return -1;
             }
         };
@@ -94,6 +110,9 @@ impl WasmCompiler {
             None
         };
 
+        // Parse again to keep the AST for queries (the compiler consumes it)
+        self.last_parse = self.parse_for_queries(&source, &script_name);
+
         if self.last_diagnostics.is_empty() {
             self.last_error = String::new();
             0
@@ -102,6 +121,38 @@ impl WasmCompiler {
             self.last_diagnostics[0].error.strref()
         }
     }
+
+    fn parse_for_queries(&self, source: &str, filename: &str) -> Option<ParsedState> {
+        let mut lexer = Lexer::new(source, filename, 0);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        parser.file_names.push(filename.to_string());
+        parser.set_collect_all_errors(true);
+        parser.set_require_entry_point(false);
+        let root = parser.parse_program().ok()?;
+        if root == NULL_NODE { return None; }
+
+        let arena = std::mem::replace(&mut parser.arena, AstArena::new());
+        let file_names = parser.file_names;
+
+        let mut checker = SemanticChecker::new(&arena, &file_names);
+        checker.set_collect_all_errors(true);
+        checker.set_require_entry_point(false);
+        if let Some(spec) = &self.lang_spec {
+            checker.load_lang_spec(spec);
+        }
+        let _ = checker.check(root);
+
+        // SAFETY: checker borrows arena/file_names but we only need the
+        // functions/structs vecs which are owned. We clone them before
+        // the checker is dropped.
+        let functions = checker.functions.clone();
+        let structs = checker.structs.clone();
+
+        Some(ParsedState { arena, root, file_names, functions, structs })
+    }
+
+    // ===== Error API =====
 
     #[wasm_bindgen(js_name = "getLastError")]
     pub fn get_last_error(&self) -> String {
@@ -131,6 +182,8 @@ impl WasmCompiler {
         }
     }
 
+    // ===== NCS API =====
+
     #[wasm_bindgen(js_name = "getNcsBytes")]
     pub fn get_ncs_bytes(&self) -> Option<Vec<u8>> {
         self.last_ncs.clone()
@@ -141,9 +194,107 @@ impl WasmCompiler {
         self.last_ncs.as_ref().map(|n| n.len() as i32).unwrap_or(0)
     }
 
+    // ===== AST API =====
+
+    #[wasm_bindgen(js_name = "getParseTreeJSON")]
+    pub fn get_parse_tree_json(&self) -> String {
+        match &self.last_parse {
+            Some(state) => {
+                let json = astquery::ast_to_json(&state.arena, state.root);
+                serde_json::to_string(&json).unwrap_or_default()
+            }
+            None => "{}".to_string(),
+        }
+    }
+
+    #[wasm_bindgen(js_name = "findNodeAtPosition")]
+    pub fn find_node_at_position(&self, line: u32, col: u32) -> String {
+        match &self.last_parse {
+            Some(state) => {
+                let q = PositionQuery::new(
+                    &state.arena, state.root, &state.functions, &state.structs, &state.file_names,
+                );
+                match q.find_node_at_position(line, col) {
+                    Some(node) => serde_json::to_string(&node).unwrap_or_default(),
+                    None => "null".to_string(),
+                }
+            }
+            None => "null".to_string(),
+        }
+    }
+
+    #[wasm_bindgen(js_name = "getDefinitionAtPosition")]
+    pub fn get_definition_at_position(&self, line: u32, col: u32) -> String {
+        match &self.last_parse {
+            Some(state) => {
+                let q = PositionQuery::new(
+                    &state.arena, state.root, &state.functions, &state.structs, &state.file_names,
+                );
+                match q.get_definition_at_position(line, col) {
+                    Some(def) => serde_json::to_string(&def).unwrap_or_default(),
+                    None => "null".to_string(),
+                }
+            }
+            None => "null".to_string(),
+        }
+    }
+
+    #[wasm_bindgen(js_name = "isInFunctionCall")]
+    pub fn is_in_function_call(&self, line: u32, col: u32) -> bool {
+        match &self.last_parse {
+            Some(state) => {
+                let q = PositionQuery::new(
+                    &state.arena, state.root, &state.functions, &state.structs, &state.file_names,
+                );
+                q.is_in_function_call(line, col)
+            }
+            None => false,
+        }
+    }
+
+    #[wasm_bindgen(js_name = "getFunctionNameAtPosition")]
+    pub fn get_function_name_at_position(&self, line: u32, col: u32) -> String {
+        match &self.last_parse {
+            Some(state) => {
+                let q = PositionQuery::new(
+                    &state.arena, state.root, &state.functions, &state.structs, &state.file_names,
+                );
+                q.get_function_name_at_position(line, col).unwrap_or_default()
+            }
+            None => String::new(),
+        }
+    }
+
+    #[wasm_bindgen(js_name = "getActiveParameterIndex")]
+    pub fn get_active_parameter_index(&self, line: u32, col: u32) -> u32 {
+        match &self.last_parse {
+            Some(state) => {
+                let q = PositionQuery::new(
+                    &state.arena, state.root, &state.functions, &state.structs, &state.file_names,
+                );
+                q.get_active_parameter_index(line, col)
+            }
+            None => 0,
+        }
+    }
+
+    #[wasm_bindgen(js_name = "getCompletionsAtPosition")]
+    pub fn get_completions_at_position(&self, line: u32, col: u32) -> String {
+        match &self.last_parse {
+            Some(state) => {
+                let q = PositionQuery::new(
+                    &state.arena, state.root, &state.functions, &state.structs, &state.file_names,
+                );
+                let comps = q.get_completions_at_position(line, col);
+                serde_json::to_string(&comps).unwrap_or_default()
+            }
+            None => "[]".to_string(),
+        }
+    }
+
     #[wasm_bindgen(js_name = "getABIVersion")]
     pub fn get_abi_version(&self) -> i32 {
-        3
+        4
     }
 }
 

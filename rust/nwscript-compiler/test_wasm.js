@@ -36,9 +36,9 @@ function assertContains(str, needle, msg) {
 // ====================================================
 
 console.log('\nABI');
-test('reports version 3', () => {
+test('reports version 4', () => {
     const c = new WasmCompiler();
-    assertEq(c.getABIVersion(), 3, 'ABI version');
+    assertEq(c.getABIVersion(), 4, 'ABI version');
     c.free();
 });
 
@@ -273,6 +273,115 @@ test('error in included file body is reported', () => {
         if (c.getCollectedError(i).includes('Mismatched')) found = true;
     }
     if (!found) throw new Error('expected type error from included file');
+    c.free();
+});
+
+console.log('\nAST JSON export');
+test('getParseTreeJSON returns valid JSON with AST', () => {
+    const c = new WasmCompiler();
+    c.setLanguageSpec(LANG_SPEC);
+    c.setRequireEntryPoint(false);
+    c.addFile('p', 'void main() { int x = 42; }');
+    c.compile('p');
+    const json = c.getParseTreeJSON();
+    const ast = JSON.parse(json);
+    assertEq(ast.version, 1, 'AST version');
+    if (!ast.ast) throw new Error('no ast root node');
+    assertEq(ast.ast.operation, 'FUNCTIONAL_UNIT', 'root is FUNCTIONAL_UNIT');
+    c.free();
+});
+
+test('AST contains function and variable nodes', () => {
+    const c = new WasmCompiler();
+    c.setLanguageSpec(LANG_SPEC);
+    c.setRequireEntryPoint(false);
+    c.addFile('p', 'int helper(int n) { return n * 2; }');
+    c.compile('p');
+    const json = c.getParseTreeJSON();
+    assertContains(json, 'FUNCTION');
+    assertContains(json, 'FUNCTION_IDENTIFIER');
+    assertContains(json, '"helper"');
+    assertContains(json, 'FUNCTION_PARAM_NAME');
+    c.free();
+});
+
+test('AST has position data', () => {
+    const c = new WasmCompiler();
+    c.setLanguageSpec(LANG_SPEC);
+    c.setRequireEntryPoint(false);
+    c.addFile('p', 'void main() { }');
+    c.compile('p');
+    const ast = JSON.parse(c.getParseTreeJSON());
+    if (!ast.ast.position) throw new Error('no position');
+    if (typeof ast.ast.position.line !== 'number') throw new Error('position.line not a number');
+    c.free();
+});
+
+console.log('\nPosition queries');
+test('findNodeAtPosition finds function name', () => {
+    const c = new WasmCompiler();
+    c.setLanguageSpec(LANG_SPEC);
+    c.setRequireEntryPoint(false);
+    c.addFile('p', 'void main() { int x = 42; }');
+    c.compile('p');
+    const node = JSON.parse(c.findNodeAtPosition(0, 5));
+    if (!node) throw new Error('no node found');
+    assertEq(node.stringData, 'main', 'found main');
+    c.free();
+});
+
+test('getDefinitionAtPosition finds function definition', () => {
+    const c = new WasmCompiler();
+    c.setLanguageSpec(LANG_SPEC);
+    c.setRequireEntryPoint(false);
+    c.addFile('p', 'int helper(int n) { return n; }\nvoid main() { int x = helper(1); }');
+    c.compile('p');
+    const def = JSON.parse(c.getDefinitionAtPosition(1, 22));
+    if (!def) throw new Error('no definition found');
+    assertEq(def.name, 'helper', 'definition name');
+    assertEq(def.kind, 'function', 'definition kind');
+    if (!def.params || def.params.length !== 1) throw new Error('expected 1 param');
+    assertEq(def.params[0].name, 'n', 'param name');
+    c.free();
+});
+
+test('isInFunctionCall detects function call context', () => {
+    const c = new WasmCompiler();
+    c.setLanguageSpec(LANG_SPEC);
+    c.setRequireEntryPoint(false);
+    c.addFile('p', 'void foo(int a) { }\nvoid main() { foo(42); }');
+    c.compile('p');
+    assertEq(c.isInFunctionCall(1, 18), true, 'inside call');
+    c.free();
+});
+
+test('getFunctionNameAtPosition returns function name', () => {
+    const c = new WasmCompiler();
+    c.setLanguageSpec(LANG_SPEC);
+    c.setRequireEntryPoint(false);
+    c.addFile('p', 'void foo(int a) { }\nvoid main() { foo(42); }');
+    c.compile('p');
+    assertEq(c.getFunctionNameAtPosition(1, 18), 'foo', 'function name');
+    c.free();
+});
+
+test('getCompletionsAtPosition returns functions and structs', () => {
+    const c = new WasmCompiler();
+    c.setLanguageSpec(LANG_SPEC);
+    c.setRequireEntryPoint(false);
+    c.addFile('p', 'struct Vec2 { int x; int y; };\nint helper(int n) { return n; }\nvoid main() { }');
+    c.compile('p');
+    const comps = JSON.parse(c.getCompletionsAtPosition(2, 14));
+    const funcComp = comps.find(c => c.name === 'helper' && c.kind === 'function');
+    const structComp = comps.find(c => c.name === 'Vec2' && c.kind === 'struct');
+    if (!funcComp) throw new Error('helper function not in completions');
+    if (!structComp) throw new Error('Vec2 struct not in completions');
+    c.free();
+});
+
+test('ABI version is 4', () => {
+    const c = new WasmCompiler();
+    assertEq(c.getABIVersion(), 4, 'ABI v4 with AST queries');
     c.free();
 });
 
