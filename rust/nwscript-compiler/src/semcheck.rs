@@ -994,29 +994,36 @@ impl<'a> SemanticChecker<'a> {
             Operation::StructurePart => {
                 let struct_type = self.check_expression(node.left)?;
                 let field_name = node.string_data.as_deref().unwrap_or("");
-                if struct_type == NwType::Struct || struct_type == NwType::Vector {
-                    // Look up field type
-                    if struct_type == NwType::Vector {
-                        match field_name {
-                            "x" | "y" | "z" => return Ok(NwType::Float),
-                            _ => {
-                                self.error_at(
-                                    CompileError::UndefinedFieldInStructure,
-                                    &node,
-                                )?;
-                                return Ok(NwType::Void);
-                            }
+
+                if struct_type == NwType::Vector {
+                    match field_name {
+                        "x" | "y" | "z" => return Ok(NwType::Float),
+                        _ => {
+                            self.error_at(CompileError::UndefinedFieldInStructure, &node)?;
+                            return Ok(NwType::Void);
                         }
                     }
-                    // TODO: look up struct fields in struct definitions
-                    Ok(NwType::Void)
-                } else {
-                    self.error_at(
-                        CompileError::LeftOfStructurePartNotStructure,
-                        &node,
-                    )?;
-                    Ok(NwType::Void)
                 }
+
+                if struct_type == NwType::Struct {
+                    // Find the struct type name from the left-hand expression
+                    let struct_name = self.resolve_struct_name(node.left);
+                    if let Some(ref sn) = struct_name {
+                        if let Some(field) = self.structs.iter()
+                            .find(|s| s.name == *sn)
+                            .and_then(|s| s.fields.iter().find(|f| f.name == field_name))
+                        {
+                            return Ok(field.nw_type);
+                        }
+                    }
+                    // Unknown struct or field — return Void but don't error
+                    // (might be from an unloaded include)
+                    return Ok(NwType::Void);
+                }
+
+                // Engine structures can have field access too (e.g. effect properties)
+                // Don't error — just return Void for unknown field access
+                Ok(NwType::Void)
             }
 
             Operation::CondBlock => {
@@ -1051,6 +1058,44 @@ impl<'a> SemanticChecker<'a> {
             Operation::Case | Operation::Default => Ok(NwType::Void),
 
             _ => Ok(NwType::Void),
+        }
+    }
+
+    fn resolve_struct_name(&self, node_id: NodeId) -> Option<String> {
+        if node_id == NULL_NODE { return None; }
+        let node = self.arena.get(node_id);
+
+        match node.op {
+            Operation::Variable => {
+                let name = node.string_data.as_deref()?;
+                // Check locals
+                if let Some(var) = self.var_stack.iter().rev().find(|v| v.name == name) {
+                    return var.type_name.clone();
+                }
+                // Check globals
+                if let Some(g) = self.globals.iter().find(|v| v.name == name) {
+                    return g.type_name.clone();
+                }
+                None
+            }
+            Operation::StructurePart => {
+                // Chained access: e.vParam0.x — resolve the left side's struct,
+                // find the field type, and return its type name
+                let parent_struct = self.resolve_struct_name(node.left)?;
+                let field_name = node.string_data.as_deref()?;
+                let sd = self.structs.iter().find(|s| s.name == parent_struct)?;
+                let field = sd.fields.iter().find(|f| f.name == field_name)?;
+                field.type_name.clone()
+            }
+            Operation::Action => {
+                // Function call return type
+                if node.left == NULL_NODE { return None; }
+                let aid = self.arena.get(node.left);
+                let func_name = aid.string_data.as_deref()?;
+                let func = self.functions.iter().find(|f| f.name == func_name)?;
+                func.return_type_name.clone()
+            }
+            _ => node.type_name.clone(),
         }
     }
 

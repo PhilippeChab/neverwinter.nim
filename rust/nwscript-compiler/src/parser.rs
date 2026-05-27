@@ -824,36 +824,55 @@ impl Parser {
         }
 
         let type_info = self.parse_type_specifier()?;
-        let name_tok = self.advance().clone();
-        if name_tok.token_type != TokenType::Identifier {
-            return Err(CompileError::BadVariableName);
-        }
+        let first_tok = self.peek().clone();
 
         let decl = self.make_node_at(
             if is_const { Operation::ConstDeclaration } else { Operation::KeywordDeclaration },
-            &name_tok,
+            &first_tok,
         );
 
-        let type_node = self.make_type_node(type_info.0, &name_tok);
+        let type_node = self.make_type_node(type_info.0, &first_tok);
         if let Some(tn) = &type_info.1 {
             self.arena.get_mut(type_node).type_name = Some(tn.clone());
         }
 
-        let var = self.make_node_at(Operation::Variable, &name_tok);
-        self.arena.get_mut(var).string_data = Some(name_tok.text.clone());
+        let mut var_chain = NULL_NODE;
 
-        if self.peek_type() == TokenType::AssignmentEqual {
-            self.advance();
-            let init = self.parse_expression()?;
-            self.arena.get_mut(var).left = init;
+        loop {
+            let name_tok = self.advance().clone();
+            if name_tok.token_type != TokenType::Identifier {
+                return Err(CompileError::BadVariableName);
+            }
+
+            let var = self.make_node_at(Operation::Variable, &name_tok);
+            self.arena.get_mut(var).string_data = Some(name_tok.text.clone());
+
+            if self.peek_type() == TokenType::AssignmentEqual {
+                self.advance();
+                let init = self.parse_expression()?;
+                self.arena.get_mut(var).left = init;
+            }
+
+            let vl = self.make_node(Operation::VariableList);
+            self.arena.get_mut(vl).left = var;
+
+            if var_chain == NULL_NODE {
+                var_chain = vl;
+            } else {
+                let last = self.find_rightmost(var_chain);
+                self.arena.get_mut(last).right = vl;
+            }
+
+            if self.peek_type() != TokenType::Comma {
+                break;
+            }
+            self.advance(); // consume comma
         }
 
         self.expect(TokenType::Semicolon)?;
 
-        let vl = self.make_node(Operation::VariableList);
-        self.arena.get_mut(vl).left = var;
         self.arena.get_mut(decl).left = type_node;
-        self.arena.get_mut(type_node).left = vl;
+        self.arena.get_mut(type_node).left = var_chain;
 
         Ok(decl)
     }
