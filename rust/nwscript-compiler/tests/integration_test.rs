@@ -428,6 +428,83 @@ fn include_global_visible_in_main() {
     assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
 }
 
+// ===================== Cross-file body type checking =====================
+
+#[test]
+fn error_in_included_function_body() {
+    let c = make_compiler(true, false);
+    let mut r = MapResolver::new();
+    r.add_file("bad_lib", "void helper() { int x = \"wrong\"; }");
+    let result = c.compile(
+        "#include \"bad_lib\"",
+        "main.nss",
+        &r,
+    );
+    assert!(
+        result.diagnostics.iter().any(|d| d.error == CompileError::MismatchedTypes),
+        "Expected type error from included file body: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn error_in_included_file_reports_correct_filename() {
+    let c = make_compiler(true, false);
+    let mut r = MapResolver::new();
+    r.add_file("mylib", "void broken() { int x = \"oops\"; }");
+    let result = c.compile(
+        "#include \"mylib\"",
+        "main.nss",
+        &r,
+    );
+    let type_err = result
+        .diagnostics
+        .iter()
+        .find(|d| d.error == CompileError::MismatchedTypes);
+    assert!(type_err.is_some(), "Expected type error: {:?}", result.diagnostics);
+    assert!(
+        type_err.unwrap().file.contains("mylib"),
+        "Error should reference mylib, got: {}",
+        type_err.unwrap().file
+    );
+}
+
+#[test]
+fn errors_in_main_and_included_file() {
+    let c = make_compiler(true, false);
+    let mut r = MapResolver::new();
+    r.add_file("lib", "void lib_fn() { string s = 42; }");
+    let result = c.compile(
+        "#include \"lib\"\nvoid main() { int x = \"bad\"; }",
+        "main.nss",
+        &r,
+    );
+    let type_errors: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.error == CompileError::MismatchedTypes)
+        .collect();
+    assert_eq!(
+        type_errors.len(),
+        2,
+        "Expected 2 type errors (one in lib, one in main): {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn valid_included_file_produces_no_errors() {
+    let c = make_compiler(true, true);
+    let mut r = MapResolver::new();
+    r.add_file("good_lib", "int helper(int n) { return n * 2; }");
+    let result = c.compile(
+        "#include \"good_lib\"\nvoid main() { int x = helper(3); }",
+        "main.nss",
+        &r,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+}
+
 // ===================== Edge cases =====================
 
 #[test]

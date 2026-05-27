@@ -102,19 +102,19 @@ impl<'a> SemanticChecker<'a> {
 
     pub fn load_included_file(&mut self, root: NodeId, arena: &AstArena, file_names: &[String]) {
         self.collect_from_arena(root, arena);
-        // Also check function bodies in included files for errors
-        if self.collect_all_errors {
-            self.check_from_arena(root, arena, file_names);
-        }
-    }
 
-    fn check_from_arena(&mut self, node_id: NodeId, arena: &AstArena, _file_names: &[String]) {
-        // For now we only collect declarations from includes.
-        // Full cross-file semantic checking would require merging arenas.
-        // TODO: walk function bodies in included files for type errors
-        if node_id == NULL_NODE {
-            return;
-        }
+        // Type-check function bodies in the included file using a temporary
+        // checker that shares our symbol tables (functions, structs, globals).
+        let mut sub = SemanticChecker::new(arena, file_names);
+        sub.collect_all_errors = self.collect_all_errors;
+        sub.require_entry_point = false;
+        sub.functions = self.functions.clone();
+        sub.structs = self.structs.clone();
+        sub.globals = self.globals.clone();
+
+        let _ = sub.check_pass(root);
+
+        self.diagnostics.extend(sub.diagnostics);
     }
 
     fn collect_from_arena(&mut self, node_id: NodeId, arena: &AstArena) {
