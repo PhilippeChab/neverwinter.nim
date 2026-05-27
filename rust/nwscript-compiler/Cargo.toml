@@ -1,0 +1,17 @@
+[package]
+name = "nwscript-compiler"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0"
+description = "NWScript compiler for Neverwinter Nights: Enhanced Edition"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
