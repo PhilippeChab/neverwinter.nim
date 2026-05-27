@@ -15,26 +15,32 @@ function loadAll(dir) {
         if (e.isDirectory()) loadAll(full);
         else if (e.name.endsWith('.nss') && e.name !== 'nwscript.nss') {
             const name = path.basename(e.name, '.nss');
-            const content = fs.readFileSync(full, 'utf-8');
-            c.addFile(name, content);
+            c.addFile(name, fs.readFileSync(full, 'utf-8'));
             allFiles.push(name);
         }
     }
 }
 loadAll('/home/philippechab/github/fru/src');
 
-// Also load nwscript.nss content as a file for includes that reference it
-// And x0_i0_stringlib if it exists in the project
-const nwscriptContent = fs.readFileSync('/home/philippechab/github/fru/nwscript.nss', 'utf-8');
-c.addFile('nwscript', nwscriptContent);
+// Also load stock NWN scripts referenced by the project.
+// In production the LSP resolves these from the NWN installation.
+// Here we provide stubs for the ones we know about.
+const stockStubs = {
+    'x0_i0_stringlib': `
+string GetTokenByPosition(string sText, string sDelimiter, int nPosition);
+int GetNumberTokens(string sText, string sDelimiter);
+`,
+};
+for (const [name, content] of Object.entries(stockStubs)) {
+    c.addFile(name, content);
+}
 
-console.log(`Loaded ${allFiles.length} files\n`);
+console.log(`Loaded ${allFiles.length} project files + ${Object.keys(stockStubs).length} stock stubs\n`);
 
-// Compile every file and collect results
 let totalErrors = 0;
 let failedFiles = [];
 for (const name of allFiles) {
-    const code = c.compile(name);
+    c.compile(name);
     const n = c.getCollectedErrorCount();
     if (n > 0) {
         failedFiles.push(name);
@@ -48,18 +54,5 @@ for (const name of allFiles) {
 }
 
 console.log(`\n${allFiles.length - failedFiles.length}/${allFiles.length} passed, ${totalErrors} total errors`);
-if (failedFiles.length > 0) {
-    // Collect unique error types
-    const errorTypes = new Set();
-    for (const name of failedFiles) {
-        c.compile(name);
-        for (let i = 0; i < c.getCollectedErrorCount(); i++) {
-            const err = c.getCollectedError(i);
-            const match = err.match(/ERROR:\s*(.+?)(?::|$)/);
-            if (match) errorTypes.add(match[1].trim());
-        }
-    }
-    console.log('\nUnique error types:');
-    for (const t of errorTypes) console.log(`  - ${t}`);
-}
 c.free();
+process.exit(failedFiles.length > 0 ? 1 : 0);
