@@ -1,5 +1,30 @@
+use std::collections::HashMap;
+
 use crate::errors::{CompileError, Diagnostic};
 use crate::token::{Token, TokenType};
+
+pub static mut ENGINE_STRUCTURE_KEYWORDS: Option<HashMap<String, TokenType>> = None;
+
+pub fn set_engine_structures(mappings: &[(u8, &str)]) {
+    let mut map = HashMap::new();
+    for &(idx, name) in mappings {
+        let tt = match idx {
+            0 => TokenType::KeywordEngineStructure0,
+            1 => TokenType::KeywordEngineStructure1,
+            2 => TokenType::KeywordEngineStructure2,
+            3 => TokenType::KeywordEngineStructure3,
+            4 => TokenType::KeywordEngineStructure4,
+            5 => TokenType::KeywordEngineStructure5,
+            6 => TokenType::KeywordEngineStructure6,
+            7 => TokenType::KeywordEngineStructure7,
+            8 => TokenType::KeywordEngineStructure8,
+            9 => TokenType::KeywordEngineStructure9,
+            _ => continue,
+        };
+        map.insert(name.to_string(), tt);
+    }
+    unsafe { ENGINE_STRUCTURE_KEYWORDS = Some(map); }
+}
 
 pub struct Lexer<'a> {
     source: &'a [u8],
@@ -593,6 +618,15 @@ fn exo_hash(s: &str) -> u32 {
 }
 
 fn keyword_lookup(word: &str) -> Option<TokenType> {
+    // Check dynamic engine structure keywords first
+    unsafe {
+        if let Some(ref map) = ENGINE_STRUCTURE_KEYWORDS {
+            if let Some(&tt) = map.get(word) {
+                return Some(tt);
+            }
+        }
+    }
+
     Some(match word {
         "int" => TokenType::KeywordInt,
         "float" => TokenType::KeywordFloat,
@@ -625,16 +659,9 @@ fn keyword_lookup(word: &str) -> Option<TokenType> {
         "JSON_STRING" => TokenType::KeywordJsonString,
         "JSON_NULL" => TokenType::KeywordJsonNull,
         "LOCATION_INVALID" => TokenType::KeywordLocationInvalid,
-        // Engine structure types (from nwscript.nss #engine_structure directives)
-        "effect" => TokenType::KeywordEngineStructure0,
-        "itemproperty" => TokenType::KeywordEngineStructure1,
-        "location" => TokenType::KeywordEngineStructure2,
-        "talent" => TokenType::KeywordEngineStructure3,
-        "event" => TokenType::KeywordEngineStructure4,
-        "command" => TokenType::KeywordEngineStructure5,
-        "sqlquery" => TokenType::KeywordEngineStructure6,
-        "json" => TokenType::KeywordEngineStructure7,
-        "cassowary" => TokenType::KeywordEngineStructure8,
+        // Engine structure types are dynamically registered via
+        // Lexer::set_engine_structures() from the lang spec's
+        // #define ENGINE_STRUCTURE_N directives.
         "__FUNCTION__" => TokenType::KeywordDashDashFunction,
         "__FILE__" => TokenType::KeywordDashDashFile,
         "__LINE__" => TokenType::KeywordDashDashLine,

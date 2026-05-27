@@ -4,11 +4,27 @@ use crate::types::NwType;
 
 fn preprocess_lang_spec(spec: &str) -> String {
     let mut result = Vec::new();
+    let mut engine_structs: Vec<(u8, String)> = Vec::new();
 
     for line in spec.lines() {
         let trimmed = line.trim();
 
-        // Skip #define directives
+        // Parse #define ENGINE_STRUCTURE_N name
+        if trimmed.starts_with("#define ENGINE_STRUCTURE_") {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 3 {
+                let define_name = parts[1];
+                let struct_name = parts[2];
+                if let Some(idx_str) = define_name.strip_prefix("ENGINE_STRUCTURE_") {
+                    if let Ok(idx) = idx_str.parse::<u8>() {
+                        engine_structs.push((idx, struct_name.to_string()));
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Skip other #define directives
         if trimmed.starts_with("#define") {
             continue;
         }
@@ -18,9 +34,13 @@ fn preprocess_lang_spec(spec: &str) -> String {
             continue;
         }
 
-        // Keep function declarations (lines with parentheses that end with ;)
-        // Keep global constant/variable declarations (type name = value;)
         result.push(line);
+    }
+
+    // Register engine structure keywords
+    if !engine_structs.is_empty() {
+        let mappings: Vec<(u8, &str)> = engine_structs.iter().map(|(i, n)| (*i, n.as_str())).collect();
+        crate::lexer::set_engine_structures(&mappings);
     }
 
     result.join("\n")

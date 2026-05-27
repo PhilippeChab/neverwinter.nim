@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use crate::ast::{AstArena, NodeId, NULL_NODE, Operation};
 use crate::codegen::CodeGenerator;
 use crate::errors::{CompileError, Diagnostic, Severity};
+use crate::lexer::set_engine_structures;
 use crate::lexer::Lexer;
 use crate::ndb::NdbBuilder;
 use crate::optimize;
@@ -77,6 +78,27 @@ struct ParsedFile {
     diagnostics: Vec<Diagnostic>,
 }
 
+fn parse_engine_structure_defines(spec: &str) {
+    let mut mappings: Vec<(u8, String)> = Vec::new();
+    for line in spec.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("#define ENGINE_STRUCTURE_") {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 3 {
+                if let Some(idx_str) = parts[1].strip_prefix("ENGINE_STRUCTURE_") {
+                    if let Ok(idx) = idx_str.parse::<u8>() {
+                        mappings.push((idx, parts[2].to_string()));
+                    }
+                }
+            }
+        }
+    }
+    if !mappings.is_empty() {
+        let refs: Vec<(u8, &str)> = mappings.iter().map(|(i, n)| (*i, n.as_str())).collect();
+        set_engine_structures(&refs);
+    }
+}
+
 pub struct Compiler {
     options: CompilerOptions,
     lang_spec: Option<String>,
@@ -91,6 +113,9 @@ impl Compiler {
     }
 
     pub fn set_language_spec(&mut self, spec: &str) {
+        // Parse engine structure definitions immediately so the lexer
+        // recognizes type names like json, effect, location etc.
+        parse_engine_structure_defines(spec);
         self.lang_spec = Some(spec.to_string());
     }
 
