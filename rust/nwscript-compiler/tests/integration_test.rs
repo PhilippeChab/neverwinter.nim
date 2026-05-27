@@ -342,6 +342,92 @@ fn function_calling_lang_spec_function() {
     assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
 }
 
+// ===================== Include resolution =====================
+
+#[test]
+fn include_resolves_function() {
+    let c = make_compiler(false, true);
+    let mut r = MapResolver::new();
+    r.add_file("lib", "int helper(int n) { return n * 2; }");
+    let result = c.compile(
+        "#include \"lib\"\nvoid main() { int x = helper(3); }",
+        "main.nss",
+        &r,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+}
+
+#[test]
+fn include_file_not_found() {
+    let c = make_compiler(false, true);
+    let r = MapResolver::new();
+    let result = c.compile(
+        "#include \"nonexistent\"\nvoid main() { }",
+        "main.nss",
+        &r,
+    );
+    assert!(result
+        .diagnostics
+        .iter()
+        .any(|d| d.error == CompileError::FileNotFound));
+}
+
+#[test]
+fn chained_includes() {
+    let c = make_compiler(false, true);
+    let mut r = MapResolver::new();
+    r.add_file("base", "int base_fn(int n) { return n; }");
+    r.add_file(
+        "mid",
+        "#include \"base\"\nint mid_fn(int n) { return base_fn(n) + 1; }",
+    );
+    let result = c.compile(
+        "#include \"mid\"\nvoid main() { int x = mid_fn(5); }",
+        "main.nss",
+        &r,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+}
+
+#[test]
+fn recursive_include_detected() {
+    let c = make_compiler(true, false);
+    let mut r = MapResolver::new();
+    r.add_file("a", "#include \"b\"\nint fa() { return 1; }");
+    r.add_file("b", "#include \"a\"\nint fb() { return 2; }");
+    let result = c.compile("#include \"a\"", "main.nss", &r);
+    assert!(result
+        .diagnostics
+        .iter()
+        .any(|d| d.error == CompileError::IncludeRecursive));
+}
+
+#[test]
+fn include_struct_visible_in_main() {
+    let c = make_compiler(false, true);
+    let mut r = MapResolver::new();
+    r.add_file("types", "struct Vec2 { int x; int y; };");
+    let result = c.compile(
+        "#include \"types\"\nvoid main() { }",
+        "main.nss",
+        &r,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+}
+
+#[test]
+fn include_global_visible_in_main() {
+    let c = make_compiler(false, true);
+    let mut r = MapResolver::new();
+    r.add_file("globals", "int gCounter = 0;");
+    let result = c.compile(
+        "#include \"globals\"\nvoid main() { int x = gCounter; }",
+        "main.nss",
+        &r,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+}
+
 // ===================== Edge cases =====================
 
 #[test]

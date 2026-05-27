@@ -100,6 +100,23 @@ impl<'a> SemanticChecker<'a> {
         }
     }
 
+    pub fn load_included_file(&mut self, root: NodeId, arena: &AstArena, file_names: &[String]) {
+        self.collect_from_arena(root, arena);
+        // Also check function bodies in included files for errors
+        if self.collect_all_errors {
+            self.check_from_arena(root, arena, file_names);
+        }
+    }
+
+    fn check_from_arena(&mut self, node_id: NodeId, arena: &AstArena, _file_names: &[String]) {
+        // For now we only collect declarations from includes.
+        // Full cross-file semantic checking would require merging arenas.
+        // TODO: walk function bodies in included files for type errors
+        if node_id == NULL_NODE {
+            return;
+        }
+    }
+
     fn collect_from_arena(&mut self, node_id: NodeId, arena: &AstArena) {
         if node_id == NULL_NODE {
             return;
@@ -117,7 +134,84 @@ impl<'a> SemanticChecker<'a> {
             Operation::Function => {
                 self.register_func_from_arena(node.left, true, arena);
             }
+            Operation::KeywordStruct => {
+                if node.left != NULL_NODE {
+                    let def = arena.get(node.left).clone();
+                    if def.op == Operation::StructureDefinition {
+                        self.register_struct_from_arena(&def, arena);
+                    }
+                }
+            }
+            Operation::GlobalVariables => {
+                self.register_global_from_arena(&node, arena);
+            }
+            Operation::ConstDeclaration => {
+                let name = node.string_data.as_deref().unwrap_or("").to_string();
+                self.globals.push(VarEntry {
+                    name,
+                    nw_type: node.nw_type,
+                    type_name: node.type_name.clone(),
+                    scope_level: 0,
+                    is_constant: true,
+                });
+            }
             _ => {}
+        }
+    }
+
+    fn register_struct_from_arena(&mut self, def_node: &AstNode, arena: &AstArena) {
+        let name = def_node.string_data.as_deref().unwrap_or("").to_string();
+        let mut fields = Vec::new();
+        let mut offset = 0;
+        let mut field_chain = def_node.left;
+
+        while field_chain != NULL_NODE {
+            let vl = arena.get(field_chain).clone();
+            if vl.left != NULL_NODE {
+                let var = arena.get(vl.left).clone();
+                let field_name = var.string_data.as_deref().unwrap_or("").to_string();
+                let size = var.nw_type.size_bytes();
+                fields.push(FieldInfo {
+                    name: field_name,
+                    nw_type: var.nw_type,
+                    type_name: var.type_name.clone(),
+                    offset,
+                });
+                offset += size;
+            }
+            field_chain = vl.right;
+        }
+
+        self.structs.push(StructDef { name, fields, byte_size: offset });
+    }
+
+    fn register_global_from_arena(&mut self, node: &AstNode, arena: &AstArena) {
+        if node.left == NULL_NODE {
+            return;
+        }
+        let decl = arena.get(node.left).clone();
+        if decl.left == NULL_NODE {
+            return;
+        }
+        let type_node = arena.get(decl.left).clone();
+        let nw_type = op_to_nw_type(type_node.op);
+        let type_name = type_node.type_name.clone();
+
+        let mut vl_id = type_node.left;
+        while vl_id != NULL_NODE {
+            let vl = arena.get(vl_id).clone();
+            if vl.left != NULL_NODE {
+                let var = arena.get(vl.left).clone();
+                let var_name = var.string_data.as_deref().unwrap_or("").to_string();
+                self.globals.push(VarEntry {
+                    name: var_name,
+                    nw_type,
+                    type_name: type_name.clone(),
+                    scope_level: 0,
+                    is_constant: false,
+                });
+            }
+            vl_id = vl.right;
         }
     }
 
