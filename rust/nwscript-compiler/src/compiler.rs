@@ -198,10 +198,10 @@ impl Compiler {
             }
         }
 
-        if all_diagnostics
+        let has_errors = all_diagnostics
             .iter()
-            .any(|d| d.error != CompileError::AlreadyPrinted)
-        {
+            .any(|d| d.severity == Severity::Error && d.error != CompileError::AlreadyPrinted);
+        if has_errors {
             return CompileResult {
                 success: false,
                 ncs: Vec::new(),

@@ -1,9 +1,10 @@
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use crate::errors::{CompileError, Diagnostic};
 use crate::token::{Token, TokenType};
 
-pub static mut ENGINE_STRUCTURE_KEYWORDS: Option<HashMap<String, TokenType>> = None;
+static ENGINE_STRUCTURE_KEYWORDS: Mutex<Option<HashMap<String, TokenType>>> = Mutex::new(None);
 
 pub fn set_engine_structures(mappings: &[(u8, &str)]) {
     let mut map = HashMap::new();
@@ -23,7 +24,7 @@ pub fn set_engine_structures(mappings: &[(u8, &str)]) {
         };
         map.insert(name.to_string(), tt);
     }
-    unsafe { ENGINE_STRUCTURE_KEYWORDS = Some(map); }
+    *ENGINE_STRUCTURE_KEYWORDS.lock().unwrap() = Some(map);
 }
 
 pub struct Lexer<'a> {
@@ -619,8 +620,8 @@ fn exo_hash(s: &str) -> u32 {
 
 fn keyword_lookup(word: &str) -> Option<TokenType> {
     // Check dynamic engine structure keywords first
-    unsafe {
-        if let Some(ref map) = ENGINE_STRUCTURE_KEYWORDS {
+    if let Ok(guard) = ENGINE_STRUCTURE_KEYWORDS.lock() {
+        if let Some(ref map) = *guard {
             if let Some(&tt) = map.get(word) {
                 return Some(tt);
             }
@@ -651,7 +652,6 @@ fn keyword_lookup(word: &str) -> Option<TokenType> {
         "OBJECT_SELF" => TokenType::KeywordObjectSelf,
         "OBJECT_INVALID" => TokenType::KeywordObjectInvalid,
         "JsonNull" => TokenType::KeywordJsonNull,
-        "JsonBool" if false => TokenType::KeywordJsonFalse, // placeholder
         "JSON_FALSE" => TokenType::KeywordJsonFalse,
         "JSON_TRUE" => TokenType::KeywordJsonTrue,
         "JSON_OBJECT" => TokenType::KeywordJsonObject,

@@ -1229,10 +1229,31 @@ impl Parser {
                         self.arena.get_mut(node).nw_type = NwType::Integer;
                         Ok(node)
                     }
-                    _ => {
+                    TokenType::KeywordDashDashFile => {
                         let node = self.make_node_at(Operation::ConstantString, &tok);
                         self.arena.get_mut(node).nw_type = NwType::String;
-                        self.arena.get_mut(node).string_data = Some(tok.text.clone());
+                        let fname = self.file_names.first().cloned().unwrap_or_default();
+                        self.arena.get_mut(node).string_data = Some(fname);
+                        Ok(node)
+                    }
+                    TokenType::KeywordDashDashFunction => {
+                        let node = self.make_node_at(Operation::ConstantString, &tok);
+                        self.arena.get_mut(node).nw_type = NwType::String;
+                        self.arena.get_mut(node).string_data = Some(String::new());
+                        self.arena.get_mut(node).int_data[1] = 1; // marker: fill in during codegen
+                        Ok(node)
+                    }
+                    TokenType::KeywordDashDashDate => {
+                        let node = self.make_node_at(Operation::ConstantString, &tok);
+                        self.arena.get_mut(node).nw_type = NwType::String;
+                        self.arena.get_mut(node).string_data = Some(String::new()); // filled at compile time
+                        Ok(node)
+                    }
+                    _ => {
+                        // __TIME__
+                        let node = self.make_node_at(Operation::ConstantString, &tok);
+                        self.arena.get_mut(node).nw_type = NwType::String;
+                        self.arena.get_mut(node).string_data = Some(String::new());
                         Ok(node)
                     }
                 }

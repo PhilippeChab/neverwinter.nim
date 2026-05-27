@@ -593,30 +593,59 @@ impl<'a> CodeGenerator<'a> {
     }
 
     fn gen_switch_body(&mut self, node_id: NodeId) -> Result<(), CompileError> {
-        if node_id == NULL_NODE { return Ok(()); }
-        let node = self.arena.get(node_id).clone();
-        if node.op == Operation::StatementList {
-            self.gen_switch_body(node.left)?;
-            self.gen_switch_body(node.right)?;
-            return Ok(());
-        }
-        match node.op {
-            Operation::Case => {
-                // Dup switch expr, compare with case value
-                self.emit_op(Opcode::RunstackCopy, 0);
-                self.emit_i32(-4); self.emit_u16(4);
-                self.stack_depth += 1;
-                if node.left != NULL_NODE { self.generate_expr(node.left)?; }
-                self.emit_op(Opcode::Equal, 0x20);
-                self.stack_depth -= 1;
-                let jz = self.emit_jmp_placeholder(Opcode::Jz);
-                self.stack_depth -= 1;
-                self.patch_jmp_here(jz);
+        // Collect all items in the switch body into a flat list
+        let mut items = Vec::new();
+        self.flatten_switch_items(node_id, &mut items);
+
+        let mut case_miss_fixup: Option<usize> = None;
+
+        for item_id in items {
+            let item = self.arena.get(item_id).clone();
+            match item.op {
+                Operation::Case => {
+                    // Patch previous case-miss to jump here
+                    if let Some(fixup) = case_miss_fixup.take() {
+                        self.patch_jmp_here(fixup);
+                    }
+                    // Dup switch expr, compare with case value
+                    self.emit_op(Opcode::RunstackCopy, 0);
+                    self.emit_i32(-4); self.emit_u16(4);
+                    self.stack_depth += 1;
+                    if item.left != NULL_NODE { self.generate_expr(item.left)?; }
+                    self.emit_op(Opcode::Equal, 0x20);
+                    self.stack_depth -= 1;
+                    let jz = self.emit_jmp_placeholder(Opcode::Jz);
+                    self.stack_depth -= 1;
+                    case_miss_fixup = Some(jz);
+                }
+                Operation::Default => {
+                    if let Some(fixup) = case_miss_fixup.take() {
+                        self.patch_jmp_here(fixup);
+                    }
+                }
+                _ => {
+                    self.generate_stmt(item_id)?;
+                }
             }
-            Operation::Default => {}
-            _ => self.generate_stmt(node_id)?,
         }
+
+        // Patch final case-miss to fall through to switch exit
+        if let Some(fixup) = case_miss_fixup {
+            self.patch_jmp_here(fixup);
+        }
+
         Ok(())
+    }
+
+    fn flatten_switch_items(&self, node_id: NodeId, items: &mut Vec<NodeId>) {
+        if node_id == NULL_NODE { return; }
+        let node = self.arena.get(node_id);
+        if node.op == Operation::StatementList {
+            self.flatten_switch_items(node.left, items);
+            self.flatten_switch_items(node.right, items);
+        } else {
+            items.push(node_id);
+        }
     }
 
     fn gen_return(&mut self, node_id: NodeId) -> Result<(), CompileError> {
@@ -695,15 +724,51 @@ impl<'a> CodeGenerator<'a> {
                     self.stack_depth += sz / 4;
                     Ok(nt)
                 } else {
-                    // Global variable — use base-pointer relative access
-                    self.emit_const_int(0); // placeholder
+                    // Global variable — use base-pointer-relative access
+                    // Globals are below the base pointer, addressed with RunstackCopyBase
+                    self.emit_op(Opcode::RunstackCopyBase, 0);
+                    self.emit_i32(-(self.global_var_size)); // offset from base pointer
+                    self.emit_u16(4);
+                    self.stack_depth += 1;
                     Ok(NwType::Integer)
                 }
             }
 
             // ---- Assignment ----
             Operation::Assignment => {
+                let op_token = node.int_data[0];
+                let is_compound = op_token != crate::token::TokenType::AssignmentEqual as i32
+                    && op_token != 0;
+
+                if is_compound && node.left != NULL_NODE {
+                    // Compound assignment (+=, -=, etc.): load current value first
+                    self.generate_expr(node.left)?;
+                }
+
                 let rt = self.generate_expr(node.right)?;
+
+                if is_compound {
+                    // Apply the operator
+                    let compound_op = match op_token {
+                        x if x == crate::token::TokenType::AssignmentPlus as i32 => Some(Opcode::Add),
+                        x if x == crate::token::TokenType::AssignmentMinus as i32 => Some(Opcode::Sub),
+                        x if x == crate::token::TokenType::AssignmentMultiply as i32 => Some(Opcode::Mul),
+                        x if x == crate::token::TokenType::AssignmentDivide as i32 => Some(Opcode::Div),
+                        x if x == crate::token::TokenType::AssignmentModulus as i32 => Some(Opcode::Modulus),
+                        x if x == crate::token::TokenType::AssignmentAnd as i32 => Some(Opcode::BooleanAnd),
+                        x if x == crate::token::TokenType::AssignmentOr as i32 => Some(Opcode::InclusiveOr),
+                        x if x == crate::token::TokenType::AssignmentXor as i32 => Some(Opcode::ExclusiveOr),
+                        x if x == crate::token::TokenType::AssignmentShiftLeft as i32 => Some(Opcode::ShiftLeft),
+                        x if x == crate::token::TokenType::AssignmentShiftRight as i32 => Some(Opcode::ShiftRight),
+                        x if x == crate::token::TokenType::AssignmentUShiftRight as i32 => Some(Opcode::UShiftRight),
+                        _ => None,
+                    };
+                    if let Some(op) = compound_op {
+                        self.emit_op(op, 0x20);
+                        self.stack_depth -= 1;
+                    }
+                }
+
                 if node.left != NULL_NODE {
                     let lhs = self.arena.get(node.left).clone();
                     if lhs.op == Operation::Variable {
@@ -715,7 +780,6 @@ impl<'a> CodeGenerator<'a> {
                             self.emit_u16(sz as u16);
                         }
                     } else if lhs.op == Operation::StructurePart {
-                        // Struct field assignment
                         self.gen_struct_field_assign(&lhs)?;
                     }
                 }

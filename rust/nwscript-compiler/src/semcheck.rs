@@ -135,9 +135,6 @@ impl<'a> SemanticChecker<'a> {
     }
 
     pub fn load_lang_spec(&mut self, spec: &str) {
-        // The nwscript.nss lang spec contains #define directives and global
-        // variable constants that our parser doesn't handle. Preprocess to
-        // extract only function declarations and global constants.
         let cleaned = preprocess_lang_spec(spec);
 
         let mut lexer = crate::lexer::Lexer::new(&cleaned, "nwscript.nss", 0);
@@ -147,12 +144,12 @@ impl<'a> SemanticChecker<'a> {
         parser.set_collect_all_errors(true);
         parser.set_require_entry_point(false);
         if let Ok(root) = parser.parse_program() {
-            self.collect_from_arena(root, &parser.arena);
+            self.collect_from_arena(root, &parser.arena, true);
         }
     }
 
     pub fn load_included_file(&mut self, root: NodeId, arena: &AstArena, file_names: &[String]) {
-        self.collect_from_arena(root, arena);
+        self.collect_from_arena(root, arena, false);
 
         // Type-check function bodies in the included file using a temporary
         // checker that shares our symbol tables (functions, structs, globals).
@@ -168,7 +165,7 @@ impl<'a> SemanticChecker<'a> {
         self.diagnostics.extend(sub.diagnostics);
     }
 
-    fn collect_from_arena(&mut self, root: NodeId, arena: &AstArena) {
+    fn collect_from_arena(&mut self, root: NodeId, arena: &AstArena, is_engine: bool) {
         // Iterative walk to avoid stack overflow on large files (nwscript.nss has 6000+ declarations)
         let mut stack = vec![root];
         while let Some(node_id) = stack.pop() {
@@ -182,10 +179,10 @@ impl<'a> SemanticChecker<'a> {
                     if node.left != NULL_NODE { stack.push(node.left); }
                 }
                 Operation::FunctionDeclaration => {
-                    self.register_func_from_arena(node.left, false, arena);
+                    self.register_func_from_arena(node.left, false, arena, is_engine);
                 }
                 Operation::Function => {
-                    self.register_func_from_arena(node.left, true, arena);
+                    self.register_func_from_arena(node.left, true, arena, is_engine);
                 }
                 Operation::KeywordStruct => {
                     if node.left != NULL_NODE {
@@ -269,7 +266,7 @@ impl<'a> SemanticChecker<'a> {
         }
     }
 
-    fn register_func_from_arena(&mut self, func_id_node: NodeId, has_impl: bool, arena: &AstArena) {
+    fn register_func_from_arena(&mut self, func_id_node: NodeId, has_impl: bool, arena: &AstArena, is_engine: bool) {
         if func_id_node == NULL_NODE {
             return;
         }
@@ -302,7 +299,7 @@ impl<'a> SemanticChecker<'a> {
                 return_type_name: fid.type_name.clone(),
                 params,
                 has_implementation: has_impl,
-                is_engine_action: true,
+                is_engine_action: is_engine,
                 action_id: 0,
             });
         }
