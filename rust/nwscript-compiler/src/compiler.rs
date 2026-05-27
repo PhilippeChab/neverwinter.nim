@@ -219,7 +219,7 @@ impl Compiler {
                 all_diagnostics.extend(codegen.diagnostics);
                 let has_errors = all_diagnostics
                     .iter()
-                    .any(|d| d.error != CompileError::AlreadyPrinted);
+                    .any(|d| d.severity == Severity::Error && d.error != CompileError::AlreadyPrinted);
 
                 // Optimization pass
                 optimize::optimize_ncs(&mut ncs, self.options.optimization_level);

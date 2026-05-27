@@ -45,8 +45,7 @@ pub struct CodeGenerator<'a> {
     current_func_name: Option<String>,
     current_return_type: NwType,
     loop_start_stack: Vec<usize>,
-    loop_exit_fixups: Vec<Vec<usize>>,
-    switch_exit_fixups: Vec<Vec<usize>>,
+    break_fixup_stack: Vec<Vec<usize>>,
     has_globals: bool,
     global_var_size: i32,
 }
@@ -70,8 +69,7 @@ impl<'a> CodeGenerator<'a> {
             current_func_name: None,
             current_return_type: NwType::Void,
             loop_start_stack: Vec::new(),
-            loop_exit_fixups: Vec::new(),
-            switch_exit_fixups: Vec::new(),
+            break_fixup_stack: Vec::new(),
             has_globals: false,
             global_var_size: 0,
         }
@@ -237,18 +235,24 @@ impl<'a> CodeGenerator<'a> {
         }
     }
 
+    fn entry_point_name(&self) -> &str {
+        if self.func_sigs.iter().any(|f| f.name == "main") {
+            "main"
+        } else if self.func_sigs.iter().any(|f| f.name == "StartingConditional") {
+            "StartingConditional"
+        } else {
+            "main"
+        }
+    }
+
     fn emit_loader(&mut self, _root: NodeId) -> Result<(), CompileError> {
-        // The loader is the entry point. It calls #globals (if present) then returns.
-        // #globals in turn calls main/StartingConditional.
+        let entry = self.entry_point_name().to_string();
         if self.has_globals {
             self.emit_op(Opcode::SaveBasePointer, 0);
             self.emit_jsr_label("#globals");
             self.emit_op(Opcode::RestoreBasePointer, 0);
-            // Clean up global variable stack space
-            // (patched after we know global_var_size)
         } else {
-            // No globals — call main directly
-            self.emit_jsr_label("main");
+            self.emit_jsr_label(&entry);
         }
         self.emit_op(Opcode::Ret, 0);
         Ok(())
@@ -262,9 +266,10 @@ impl<'a> CodeGenerator<'a> {
         // Walk the tree to emit global variable initializers
         self.emit_global_var_inits(root)?;
 
-        // After globals are initialized, call main
+        // After globals are initialized, call entry point
+        let entry = self.entry_point_name().to_string();
         self.emit_op(Opcode::SaveBasePointer, 0);
-        self.emit_jsr_label("main");
+        self.emit_jsr_label(&entry);
         self.emit_op(Opcode::RestoreBasePointer, 0);
 
         // Clean up globals from stack
@@ -462,8 +467,7 @@ impl<'a> CodeGenerator<'a> {
             Operation::Return => self.gen_return(node_id)?,
             Operation::Break => {
                 let fix = self.emit_jmp_placeholder(Opcode::Jmp);
-                if let Some(exits) = self.loop_exit_fixups.last_mut()
-                    .or(self.switch_exit_fixups.last_mut()) {
+                if let Some(exits) = self.break_fixup_stack.last_mut() {
                     exits.push(fix);
                 }
             }
@@ -536,7 +540,7 @@ impl<'a> CodeGenerator<'a> {
         let node = self.arena.get(node_id).clone();
         let loop_top = self.pos();
         self.loop_start_stack.push(loop_top);
-        self.loop_exit_fixups.push(Vec::new());
+        self.break_fixup_stack.push(Vec::new());
 
         if node.left != NULL_NODE {
             let cond = self.arena.get(node.left).clone();
@@ -552,7 +556,7 @@ impl<'a> CodeGenerator<'a> {
         self.emit_jmp_to(Opcode::Jmp, loop_top);
         self.patch_jmp_here(jz);
 
-        for f in self.loop_exit_fixups.pop().unwrap_or_default() { self.patch_jmp_here(f); }
+        for f in self.break_fixup_stack.pop().unwrap_or_default() { self.patch_jmp_here(f); }
         self.loop_start_stack.pop();
         Ok(())
     }
@@ -561,7 +565,7 @@ impl<'a> CodeGenerator<'a> {
         let node = self.arena.get(node_id).clone();
         let loop_top = self.pos();
         self.loop_start_stack.push(loop_top);
-        self.loop_exit_fixups.push(Vec::new());
+        self.break_fixup_stack.push(Vec::new());
 
         self.generate_stmt(node.left)?;
 
@@ -572,14 +576,14 @@ impl<'a> CodeGenerator<'a> {
         self.emit_jmp_to(Opcode::Jnz, loop_top);
         self.stack_depth -= 1;
 
-        for f in self.loop_exit_fixups.pop().unwrap_or_default() { self.patch_jmp_here(f); }
+        for f in self.break_fixup_stack.pop().unwrap_or_default() { self.patch_jmp_here(f); }
         self.loop_start_stack.pop();
         Ok(())
     }
 
     fn gen_switch(&mut self, node_id: NodeId) -> Result<(), CompileError> {
         let node = self.arena.get(node_id).clone();
-        self.switch_exit_fixups.push(Vec::new());
+        self.break_fixup_stack.push(Vec::new());
 
         if node.left != NULL_NODE {
             let cond = self.arena.get(node.left).clone();
@@ -588,7 +592,7 @@ impl<'a> CodeGenerator<'a> {
         self.gen_switch_body(node.right)?;
         self.emit_modify_sp(-4); // pop switch expression
 
-        for f in self.switch_exit_fixups.pop().unwrap_or_default() { self.patch_jmp_here(f); }
+        for f in self.break_fixup_stack.pop().unwrap_or_default() { self.patch_jmp_here(f); }
         Ok(())
     }
 
