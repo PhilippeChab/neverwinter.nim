@@ -10,6 +10,7 @@ pub struct WasmCompiler {
     files: HashMap<String, String>,
     last_diagnostics: Vec<Diagnostic>,
     last_error: String,
+    last_ncs: Option<Vec<u8>>,
     require_entry_point: bool,
     collect_all_errors: bool,
 }
@@ -23,6 +24,7 @@ impl WasmCompiler {
             files: HashMap::new(),
             last_diagnostics: Vec::new(),
             last_error: String::new(),
+            last_ncs: None,
             require_entry_point: true,
             collect_all_errors: false,
         }
@@ -86,6 +88,11 @@ impl WasmCompiler {
         let result = compiler.compile(&source, &script_name, &resolver);
 
         self.last_diagnostics = result.diagnostics;
+        self.last_ncs = if result.success && !result.ncs.is_empty() {
+            Some(result.ncs)
+        } else {
+            None
+        };
 
         if self.last_diagnostics.is_empty() {
             self.last_error = String::new();
@@ -122,6 +129,16 @@ impl WasmCompiler {
         } else {
             0
         }
+    }
+
+    #[wasm_bindgen(js_name = "getNcsBytes")]
+    pub fn get_ncs_bytes(&self) -> Option<Vec<u8>> {
+        self.last_ncs.clone()
+    }
+
+    #[wasm_bindgen(js_name = "getNcsSize")]
+    pub fn get_ncs_size(&self) -> i32 {
+        self.last_ncs.as_ref().map(|n| n.len() as i32).unwrap_or(0)
     }
 
     #[wasm_bindgen(js_name = "getABIVersion")]

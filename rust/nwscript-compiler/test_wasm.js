@@ -200,6 +200,82 @@ test('engine function from lang spec resolves', () => {
     c.free();
 });
 
+console.log('\nNCS output');
+test('emits NCS bytes with valid header', () => {
+    const c = new WasmCompiler();
+    c.setLanguageSpec(LANG_SPEC);
+    c.addFile('p', 'void main() { int x = 1 + 2; }');
+    const code = c.compile('p');
+    assertEq(code, 0, 'compile code');
+    const ncs = c.getNcsBytes();
+    if (!ncs || ncs.length < 13) throw new Error('no NCS output or too short');
+    const magic = String.fromCharCode(...ncs.slice(0, 8));
+    assertEq(magic, 'NCS V1.0', 'NCS magic');
+    assertEq(ncs[8], 'B'.charCodeAt(0), 'size marker');
+    c.free();
+});
+
+test('NCS size in header matches actual size', () => {
+    const c = new WasmCompiler();
+    c.setLanguageSpec(LANG_SPEC);
+    c.addFile('p', 'void main() { int x = 42; }');
+    c.compile('p');
+    const ncs = c.getNcsBytes();
+    const view = new DataView(ncs.buffer, ncs.byteOffset, ncs.byteLength);
+    const headerSize = view.getInt32(9);
+    assertEq(headerSize, ncs.length, 'header size matches actual');
+    c.free();
+});
+
+test('compile is deterministic (identical bytes twice)', () => {
+    const c = new WasmCompiler();
+    c.setLanguageSpec(LANG_SPEC);
+    c.addFile('p', 'void main() { int x = 1 + 2; int y = x * 3; }');
+    c.compile('p');
+    const a = Array.from(c.getNcsBytes());
+    c.compile('p');
+    const b = Array.from(c.getNcsBytes());
+    assertEq(JSON.stringify(a), JSON.stringify(b), 'deterministic output');
+    c.free();
+});
+
+test('no NCS bytes on compile error', () => {
+    const c = new WasmCompiler();
+    c.setLanguageSpec(LANG_SPEC);
+    c.addFile('p', 'void main() { DoesNotExist(); }');
+    c.compile('p');
+    assertEq(c.getNcsSize(), 0, 'no NCS on error');
+    c.free();
+});
+
+test('getNcsSize returns correct size', () => {
+    const c = new WasmCompiler();
+    c.setLanguageSpec(LANG_SPEC);
+    c.addFile('p', 'void main() { }');
+    c.compile('p');
+    const size = c.getNcsSize();
+    const ncs = c.getNcsBytes();
+    assertEq(size, ncs.length, 'size matches');
+    c.free();
+});
+
+console.log('\nCross-file errors');
+test('error in included file body is reported', () => {
+    const c = new WasmCompiler();
+    c.setLanguageSpec(LANG_SPEC);
+    c.setCollectAllErrors(true);
+    c.setRequireEntryPoint(false);
+    c.addFile('badlib', 'void helper() { int x = "wrong"; }');
+    c.addFile('main', '#include "badlib"');
+    c.compile('main');
+    let found = false;
+    for (let i = 0; i < c.getCollectedErrorCount(); i++) {
+        if (c.getCollectedError(i).includes('Mismatched')) found = true;
+    }
+    if (!found) throw new Error('expected type error from included file');
+    c.free();
+});
+
 // ====================================================
 
 console.log(`\n${pass} passed, ${fail} failed`);

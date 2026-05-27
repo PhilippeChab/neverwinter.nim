@@ -156,10 +156,10 @@ impl Compiler {
 
         match checker.check(main_parsed.root) {
             Ok(()) => {
-                all_diagnostics.extend(checker.diagnostics);
+                all_diagnostics.extend(checker.diagnostics.clone());
             }
             Err(_) => {
-                all_diagnostics.extend(checker.diagnostics);
+                all_diagnostics.extend(checker.diagnostics.clone());
                 if !self.options.collect_all_errors {
                     return CompileResult {
                         success: false,
@@ -186,6 +186,7 @@ impl Compiler {
         // Code generation
         let mut codegen = CodeGenerator::new(&main_parsed.arena, &main_parsed.file_names);
         codegen.set_collect_all_errors(self.options.collect_all_errors);
+        codegen.load_symbols(&checker);
         match codegen.generate(main_parsed.root) {
             Ok(ncs) => {
                 all_diagnostics.extend(codegen.diagnostics);
