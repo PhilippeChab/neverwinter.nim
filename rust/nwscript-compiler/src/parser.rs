@@ -674,6 +674,7 @@ impl Parser {
         self.expect(TokenType::LeftBracket)?;
 
         let init = if self.peek_type() == TokenType::Semicolon {
+            self.advance();
             NULL_NODE
         } else if self.peek_type().is_non_void_type_specifier() || self.peek_type() == TokenType::KeywordStruct {
             self.parse_local_declaration()?
