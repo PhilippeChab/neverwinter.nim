@@ -4,13 +4,7 @@ A NWScript compiler written in Rust, targeting WebAssembly for use in the [nwscr
 
 ## Why
 
-The original NWScript compiler is a ~19,000-line C++ codebase written by BioWare, wrapped in Nim by [neverwinter.nim](https://github.com/niv/neverwinter.nim). It works well as a CLI tool, but integrating it into a language server proved difficult:
-
-- **C++/Emscripten WASM approach** ([wasm-lsp branch](https://github.com/PhilippeChab/neverwinter.nim/tree/wasm-lsp)): Required extensive multi-error recovery patches to the C++ code. The Emscripten JS runtime added 66KB of glue code, and the JS↔WASM boundary caused memory bugs (double-free in resolver callbacks).
-
-- **Native binary approach** ([PR #77](https://github.com/PhilippeChab/nwscript-ee-language-server/pull/77)): Shelled out to `nwn_script_comp` as a child process. Required shipping 3 platform-specific binaries (~13MB), suffered from process leak bugs, and couldn't report multiple errors per file.
-
-This Rust rewrite solves all of these problems by designing the compiler for LSP use from the start, with clean WASM output via `wasm-bindgen`.
+The [nwscript-ee-language-server](https://github.com/PhilippeChab/nwscript-ee-language-server) needed a compiler that runs in-process as WASM — cross-platform, no native binaries to ship, multi-error reporting, and an AST query API for IDE features (go-to-definition, completions, signature help). Rust's first-class WASM support via `wasm-bindgen` made it the right tool for this.
 
 ## Built by
 

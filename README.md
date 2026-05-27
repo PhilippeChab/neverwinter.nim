@@ -6,6 +6,8 @@ by Neverwinter Nights: Enhanced Edition.
 It also includes the official script compiler source code and CLI utility, as well
 as tools to maintain a serverside NWSync repository.
 
+> **[Rust NWScript Compiler](rust/nwscript-compiler/)** — A Rust rewrite of the NWScript compiler targeting WASM for the [nwscript-ee-language-server](https://github.com/PhilippeChab/nwscript-ee-language-server) VS Code extension.
+
 Binary releases are available on the Github Releases page of this project. You do
 not need to install anything else.
 
