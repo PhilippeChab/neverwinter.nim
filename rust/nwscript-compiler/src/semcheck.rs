@@ -662,8 +662,13 @@ impl<'a> SemanticChecker<'a> {
             Operation::Return => {
                 if node.left != NULL_NODE {
                     let ret_type = self.check_expression(node.left)?;
-                    if ret_type != self.current_return_type
-                        && self.current_return_type != NwType::Void
+                    if self.current_return_type == NwType::Void {
+                        self.error_at(
+                            CompileError::ReturnTypeAndFunctionTypeMismatched,
+                            &node,
+                        )?;
+                    } else if ret_type != self.current_return_type
+                        && ret_type != NwType::Void
                     {
                         self.error_at(
                             CompileError::ReturnTypeAndFunctionTypeMismatched,
