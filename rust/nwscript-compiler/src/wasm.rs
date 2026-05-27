@@ -173,6 +173,18 @@ impl WasmCompiler {
         }
     }
 
+    #[wasm_bindgen(js_name = "getCollectedErrorSeverity")]
+    pub fn get_collected_error_severity(&self, index: i32) -> i32 {
+        if let Some(d) = self.last_diagnostics.get(index as usize) {
+            match d.severity {
+                crate::errors::Severity::Error => 0,
+                crate::errors::Severity::Warning => 1,
+            }
+        } else {
+            0
+        }
+    }
+
     #[wasm_bindgen(js_name = "getCollectedErrorCode")]
     pub fn get_collected_error_code(&self, index: i32) -> i32 {
         if let Some(d) = self.last_diagnostics.get(index as usize) {

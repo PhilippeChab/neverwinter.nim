@@ -262,6 +262,7 @@ impl<'a> SemanticChecker<'a> {
         };
         self.diagnostics.push(Diagnostic {
             error: err,
+            severity: err.default_severity(),
             file,
             line: node.line,
             message: err.message().to_string(),
@@ -291,6 +292,7 @@ impl<'a> SemanticChecker<'a> {
         };
         self.diagnostics.push(Diagnostic {
             error: err,
+            severity: err.default_severity(),
             file,
             line: node.line,
             message: msg,

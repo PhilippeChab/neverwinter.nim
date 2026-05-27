@@ -69,6 +69,7 @@ impl Parser {
             String::from("<unknown>")
         };
         self.diagnostics.push(Diagnostic {
+            severity: err.default_severity(),
             error: err,
             file,
             line: tok.line,

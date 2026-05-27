@@ -80,6 +80,7 @@ impl<'a> Lexer<'a> {
 
     fn error(&mut self, err: CompileError) {
         self.diagnostics.push(Diagnostic {
+            severity: err.default_severity(),
             error: err,
             file: self.file_name.clone(),
             line: self.line,

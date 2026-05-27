@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::ast::{AstArena, NodeId, NULL_NODE, Operation};
 use crate::codegen::CodeGenerator;
-use crate::errors::{CompileError, Diagnostic};
+use crate::errors::{CompileError, Diagnostic, Severity};
 use crate::lexer::Lexer;
 use crate::ndb::NdbBuilder;
 use crate::optimize;
@@ -218,6 +218,7 @@ impl Compiler {
             Err(e) => {
                 all_diagnostics.push(Diagnostic {
                     error: e,
+                    severity: e.default_severity(),
                     file: filename.to_string(),
                     line: 0,
                     message: e.message().to_string(),
@@ -247,6 +248,7 @@ impl Compiler {
             Err(e) => {
                 diagnostics.push(Diagnostic {
                     error: e,
+                    severity: e.default_severity(),
                     file: filename.to_string(),
                     line: 0,
                     message: e.message().to_string(),
@@ -332,6 +334,7 @@ impl Compiler {
         if depth >= self.options.max_include_depth {
             diagnostics.push(Diagnostic {
                 error: CompileError::IncludeTooManyLevels,
+                severity: Severity::Error,
                 file: include_stack.last().cloned().unwrap_or_default(),
                 line: node.line,
                 message: CompileError::IncludeTooManyLevels.message().to_string(),
@@ -342,6 +345,7 @@ impl Compiler {
         if include_stack.contains(&inc_name.to_string()) {
             diagnostics.push(Diagnostic {
                 error: CompileError::IncludeRecursive,
+                severity: Severity::Error,
                 file: include_stack.last().cloned().unwrap_or_default(),
                 line: node.line,
                 message: format!("{}: {}", CompileError::IncludeRecursive.message(), inc_name),
@@ -358,6 +362,7 @@ impl Compiler {
             None => {
                 diagnostics.push(Diagnostic {
                     error: CompileError::FileNotFound,
+                    severity: Severity::Error,
                     file: include_stack.last().cloned().unwrap_or_default(),
                     line: node.line,
                     message: format!("{}: {}", CompileError::FileNotFound.message(), inc_name),

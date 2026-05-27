@@ -328,9 +328,30 @@ impl fmt::Display for CompileError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Error,
+    Warning,
+}
+
+impl CompileError {
+    pub fn default_severity(self) -> Severity {
+        match self {
+            Self::NotAllControlPathsReturnAValue
+            | Self::IfConditionCannotBeFollowedByNullStatement
+            | Self::ElseCannotBeFollowedByNullStatement
+            | Self::WhileConditionCannotBeFollowedByNullStatement
+            | Self::ForStatementCannotBeFollowedByNullStatement
+            | Self::SwitchConditionCannotBeFollowedByNullStatement => Severity::Warning,
+            _ => Severity::Error,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
     pub error: CompileError,
+    pub severity: Severity,
     pub file: String,
     pub line: u32,
     pub message: String,
@@ -338,6 +359,10 @@ pub struct Diagnostic {
 
 impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}({}): ERROR: {}", self.file, self.line, self.message)
+        let label = match self.severity {
+            Severity::Error => "ERROR",
+            Severity::Warning => "WARNING",
+        };
+        write!(f, "{}({}): {}: {}", self.file, self.line, label, self.message)
     }
 }
