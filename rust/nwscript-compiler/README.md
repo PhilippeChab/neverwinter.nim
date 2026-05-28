@@ -6,6 +6,12 @@ A NWScript compiler written in Rust, targeting WebAssembly for use in the [nwscr
 
 The [nwscript-ee-language-server](https://github.com/PhilippeChab/nwscript-ee-language-server) needed a compiler that runs in-process as WASM — cross-platform, no native binaries to ship, multi-error reporting, and an AST query API for IDE features (go-to-definition, completions, signature help). Rust's first-class WASM support via `wasm-bindgen` made it the right tool for this.
 
+## ⚠ Not for shipping NCS to the game
+
+This compiler is built for **LSP diagnostics** — catching errors as you type, providing AST queries for IDE features. The NCS bytecode it emits is structurally correct but has **not** been verified byte-for-byte against `nwn_script_comp` and has **not** been tested in the NWN:EE virtual machine.
+
+**Use `nwn_script_comp` (the official C++ compiler) to compile scripts you actually intend to run on a game server or in a module.** This Rust compiler is the right tool for editor tooling; it is not yet the right tool for producing shippable game artifacts.
+
 ## Built by
 
 This compiler was implemented by [Claude Code](https://claude.ai/claude-code) (Claude Opus 4.7), Anthropic's AI coding agent, in collaboration with [Philippe Chabot](https://github.com/PhilippeChab). The full implementation — lexer, parser, semantic checker, code generator, WASM bindings, BIF/KEY reader, and test suite — was built and iterated on over a single extended session, tested against a real NWScript project (75 files, 0 errors).
