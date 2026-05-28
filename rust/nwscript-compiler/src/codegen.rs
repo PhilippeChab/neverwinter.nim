@@ -47,6 +47,12 @@ pub struct CodeGenerator<'a> {
     current_return_slot_offset: i32,
     optimization_level: u32,
     reachable_functions: std::collections::HashSet<String>,
+    // NDB debug data
+    pub ndb_functions: Vec<crate::ndb::NdbFunctionEntry>,
+    pub ndb_variables: Vec<crate::ndb::NdbVarEntry>,
+    pub ndb_lines: Vec<crate::ndb::NdbLineEntry>,
+    pub ndb_structs: Vec<crate::ndb::NdbStructDef>,
+    current_func_start: usize,
     loop_start_stack: Vec<usize>,
     break_fixup_stack: Vec<Vec<usize>>,
     continue_fixup_stack: Vec<Vec<usize>>,
@@ -75,6 +81,11 @@ impl<'a> CodeGenerator<'a> {
             current_return_slot_offset: 0,
             optimization_level: 0,
             reachable_functions: std::collections::HashSet::new(),
+            ndb_functions: Vec::new(),
+            ndb_variables: Vec::new(),
+            ndb_lines: Vec::new(),
+            ndb_structs: Vec::new(),
+            current_func_start: 0,
             loop_start_stack: Vec::new(),
             break_fixup_stack: Vec::new(),
             continue_fixup_stack: Vec::new(),
@@ -447,6 +458,7 @@ impl<'a> CodeGenerator<'a> {
         self.add_label(&func_name);
         self.current_func_name = Some(func_name.clone());
         self.current_return_type = return_type;
+        self.current_func_start = self.pos();
 
         let saved_locals = self.locals.len();
         let saved_depth = self.stack_depth;
@@ -498,6 +510,20 @@ impl<'a> CodeGenerator<'a> {
 
         self.emit_op(Opcode::Ret, 0);
 
+        // Record NDB function entry
+        let func_end = self.pos();
+        let ndb_params: Vec<_> = params.iter()
+            .map(|(_, t, n, _)| (*t, n.clone().unwrap_or_default()))
+            .collect();
+        self.ndb_functions.push(crate::ndb::NdbFunctionEntry {
+            name: func_name.clone(),
+            return_type,
+            return_struct_name: fid.type_name.clone().unwrap_or_default(),
+            code_start: self.current_func_start as u32,
+            code_end: func_end as u32,
+            params: ndb_params,
+        });
+
         self.locals.truncate(saved_locals);
         self.stack_depth = saved_depth;
         self.scope_level = 0;
@@ -528,10 +554,18 @@ impl<'a> CodeGenerator<'a> {
             Operation::CompoundStatement => {
                 self.scope_level += 1;
                 let saved = self.locals.len();
+                let saved_ndb_vars = self.ndb_variables.len();
                 let saved_depth = self.stack_depth;
                 self.generate_stmt(node.left)?;
                 let alloc: i32 = self.locals[saved..].iter().map(|l| l.size).sum();
                 if alloc > 0 { self.emit_modify_sp(-alloc); }
+                // Patch NDB var end positions for vars that went out of scope here
+                let end_pos = self.pos() as u32;
+                for v in &mut self.ndb_variables[saved_ndb_vars..] {
+                    if v.code_end == 0 {
+                        v.code_end = end_pos;
+                    }
+                }
                 self.locals.truncate(saved);
                 self.scope_level -= 1;
                 self.stack_depth = saved_depth;
@@ -541,7 +575,19 @@ impl<'a> CodeGenerator<'a> {
                 self.generate_stmt(node.right)?;
             }
             Operation::Statement | Operation::StatementNoDebug => {
+                let line_start = self.pos();
+                let line = node.line;
+                let file_id = node.file_id;
                 self.generate_stmt(node.left)?;
+                let line_end = self.pos();
+                if node.op == Operation::Statement && line > 0 && line_end > line_start {
+                    self.ndb_lines.push(crate::ndb::NdbLineEntry {
+                        file_id: file_id as u8,
+                        line,
+                        code_start: line_start as u32,
+                        code_end: line_end as u32,
+                    });
+                }
             }
             Operation::KeywordDeclaration | Operation::ConstDeclaration => {
                 self.gen_local_decl(node_id)?;
@@ -596,6 +642,18 @@ impl<'a> CodeGenerator<'a> {
                     self.emit_default_value(nw_type);
                 }
                 let offset = self.stack_depth * 4;
+
+                // NDB: record variable lifetime starting here
+                let code_start = self.pos();
+                self.ndb_variables.push(crate::ndb::NdbVarEntry {
+                    name: name.clone(),
+                    var_type: nw_type,
+                    struct_name: type_name.clone().unwrap_or_default(),
+                    stack_loc: offset as u32,
+                    code_start: code_start as u32,
+                    code_end: 0, // patched when scope exits
+                });
+
                 self.locals.push(LocalVar {
                     name, nw_type, type_name: type_name.clone(),
                     stack_offset: offset, scope_level: self.scope_level, size,

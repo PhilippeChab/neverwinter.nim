@@ -429,3 +429,28 @@ fn include_with_compilation() {
     assert!(result.success, "{:?}", result.diagnostics);
     assert!(ncs_header_valid(&result.ncs));
 }
+
+#[test]
+fn ndb_populated_with_function_and_variable_entries() {
+    let mut c = Compiler::new(CompilerOptions {
+        require_entry_point: false,
+        generate_debug: true,
+        ..Default::default()
+    });
+    let r = MapResolver::new();
+    let result = c.compile(
+        "int add(int a, int b) { int c = a + b; return c; }\nvoid main() { int x = add(1, 2); }",
+        "test.nss",
+        &r,
+    );
+    let ndb = String::from_utf8(result.ndb).expect("NDB should be valid UTF-8");
+    assert!(ndb.starts_with("NDB V1.0"));
+    assert!(ndb.contains("N00 test.nss"));
+    // Should have function entries for add and main
+    assert!(ndb.contains(" add"), "NDB missing add function: {}", ndb);
+    assert!(ndb.contains(" main"), "NDB missing main function: {}", ndb);
+    // Should have variable entries for c, x
+    assert!(ndb.contains("i c") || ndb.contains("i x"), "NDB missing var entries: {}", ndb);
+    // Should have line entries
+    assert!(ndb.contains("l 00 "), "NDB missing line entries: {}", ndb);
+}

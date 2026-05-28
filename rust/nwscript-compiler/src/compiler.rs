@@ -333,6 +333,18 @@ impl Compiler {
                     let mut builder = NdbBuilder::new();
                     builder.add_file(filename);
                     builder.set_base_file(filename);
+                    for f in codegen.ndb_functions.iter().cloned() {
+                        builder.add_function(f);
+                    }
+                    for v in codegen.ndb_variables.iter().cloned() {
+                        builder.add_variable(v);
+                    }
+                    for s in codegen.ndb_structs.iter().cloned() {
+                        builder.add_struct(s);
+                    }
+                    for l in codegen.ndb_lines.iter().cloned() {
+                        builder.add_line(l);
+                    }
                     builder.generate()
                 } else {
                     Vec::new()
