@@ -1253,15 +1253,17 @@ impl<'a> SemanticChecker<'a> {
                     // Find the struct type name from the left-hand expression
                     let struct_name = self.resolve_struct_name(node.left);
                     if let Some(ref sn) = struct_name {
-                        if let Some(field) = self.structs.iter()
-                            .find(|s| s.name == *sn)
-                            .and_then(|s| s.fields.iter().find(|f| f.name == field_name))
-                        {
-                            return Ok(field.nw_type);
+                        if let Some(sd) = self.structs.iter().find(|s| s.name == *sn) {
+                            // Struct is known — check the field exists
+                            if let Some(field) = sd.fields.iter().find(|f| f.name == field_name) {
+                                return Ok(field.nw_type);
+                            }
+                            // Struct known but field doesn't exist — real error
+                            self.error_at(CompileError::UndefinedFieldInStructure, &node)?;
+                            return Ok(NwType::Void);
                         }
                     }
-                    // Unknown struct or field — return Void but don't error
-                    // (might be from an unloaded include)
+                    // Struct definition unknown (probably from an unloaded include) — silent
                     return Ok(NwType::Void);
                 }
 
