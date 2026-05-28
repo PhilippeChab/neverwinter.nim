@@ -571,13 +571,47 @@ impl<'a> SemanticChecker<'a> {
 
     fn register_const_global(&mut self, node: &AstNode) {
         let name = node.string_data.as_deref().unwrap_or("").to_string();
+        let declared_type = node.nw_type;
+
+        // Check initializer type matches declared type
+        if node.left != NULL_NODE {
+            let init_type = match self.infer_const_type(node.left) {
+                Some(t) => t,
+                None => declared_type, // can't infer — don't error
+            };
+            if init_type != declared_type
+                && init_type != NwType::Void
+                && declared_type != NwType::Void
+            {
+                let _ = self.error_at(CompileError::MismatchedTypes, node);
+            }
+        }
+
         self.globals.push(VarEntry {
             name,
-            nw_type: node.nw_type,
+            nw_type: declared_type,
             type_name: node.type_name.clone(),
             scope_level: 0,
             is_constant: true,
         });
+    }
+
+    /// Infer the type of a constant initializer expression without needing
+    /// the full check_expression machinery (which mutates state).
+    fn infer_const_type(&self, node_id: NodeId) -> Option<NwType> {
+        if node_id == NULL_NODE { return None; }
+        let node = self.arena.get(node_id);
+        match node.op {
+            Operation::ConstantInteger => Some(NwType::Integer),
+            Operation::ConstantFloat => Some(NwType::Float),
+            Operation::ConstantString => Some(NwType::String),
+            Operation::ConstantObject => Some(NwType::Object),
+            Operation::ConstantVector => Some(NwType::Vector),
+            Operation::ConstantJson => Some(NwType::EngineStructure(7)),
+            Operation::ConstantLocation => Some(NwType::EngineStructure(2)),
+            Operation::Negation => self.infer_const_type(node.left),
+            _ => None,
+        }
     }
 
     fn check_pass(&mut self, root: NodeId) -> Result<(), CompileError> {
