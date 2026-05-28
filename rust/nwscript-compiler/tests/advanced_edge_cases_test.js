@@ -61,6 +61,8 @@ console.log('\n=== Unicode in strings ===');
 check('unicode in string', false, 'void main() { string s = "héllo wörld"; }');
 
 console.log('\n=== Include edge cases ===');
+// C++ behavior: #include "foo.nss" with extension errors (ResMan looks for foo.nss.nss).
+// We match that — users must write #include "foo" without extension.
 {
     const c = new WasmCompiler();
     c.setRequireEntryPoint(false);
@@ -70,8 +72,8 @@ console.log('\n=== Include edge cases ===');
     c.compile('t');
     const n = c.getCollectedErrorCount();
     c.free();
-    if (n === 0) { pass++; console.log('✓ include with .nss extension'); }
-    else { fail++; failures.push({name: 'include with .nss', errs: [c.getCollectedError ? 'err' : 'multiple errors']}); console.log('✗ include with .nss extension'); }
+    if (n > 0) { pass++; console.log('✓ include with .nss extension errors (matches C++)'); }
+    else { fail++; failures.push({name: 'include with .nss', errs: ['no error']}); console.log('✗ include with .nss — expected error to match C++'); }
 }
 check('empty include name', true, '#include ""\nvoid main() { }', 'not found');
 

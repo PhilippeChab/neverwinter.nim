@@ -336,15 +336,9 @@ pub enum Severity {
 
 impl CompileError {
     pub fn default_severity(self) -> Severity {
-        match self {
-            Self::NotAllControlPathsReturnAValue
-            | Self::IfConditionCannotBeFollowedByNullStatement
-            | Self::ElseCannotBeFollowedByNullStatement
-            | Self::WhileConditionCannotBeFollowedByNullStatement
-            | Self::ForStatementCannotBeFollowedByNullStatement
-            | Self::SwitchConditionCannotBeFollowedByNullStatement => Severity::Warning,
-            _ => Severity::Error,
-        }
+        // The C++ NWScript compiler does not emit warnings — every diagnostic is
+        // a hard error via OutputWalkTreeError or PARSER_ERROR. Match that.
+        Severity::Error
     }
 }
 
