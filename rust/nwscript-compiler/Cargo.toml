@@ -3,7 +3,12 @@ name = "nwscript-compiler"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0"
-description = "NWScript compiler for Neverwinter Nights: Enhanced Edition"
+description = "NWScript compiler for Neverwinter Nights: Enhanced Edition, targeting WebAssembly for LSP use"
+repository = "https://github.com/PhilippeChab/neverwinter.nim"
+authors = ["Philippe Chabot <philippe.chabz@gmail.com>"]
+keywords = ["nwscript", "compiler", "wasm", "neverwinter", "lsp"]
+categories = ["compilers", "wasm", "development-tools"]
+readme = "README.md"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
