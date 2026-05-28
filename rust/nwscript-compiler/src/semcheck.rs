@@ -221,6 +221,16 @@ impl<'a> SemanticChecker<'a> {
             if vl.left != NULL_NODE {
                 let var = arena.get(vl.left).clone();
                 let field_name = var.string_data.as_deref().unwrap_or("").to_string();
+
+                // Detect recursive struct: field type same as containing struct
+                if var.nw_type == NwType::Struct {
+                    if let Some(tn) = &var.type_name {
+                        if *tn == name {
+                            let _ = self.error_at(CompileError::UndefinedStructure, &var);
+                        }
+                    }
+                }
+
                 let size = self.field_size(var.nw_type, &var.type_name);
                 fields.push(FieldInfo {
                     name: field_name,
@@ -455,6 +465,16 @@ impl<'a> SemanticChecker<'a> {
             if vl.left != NULL_NODE {
                 let var = self.arena.get(vl.left).clone();
                 let field_name = var.string_data.as_deref().unwrap_or("").to_string();
+
+                // Detect recursive struct: field type same as containing struct
+                if var.nw_type == NwType::Struct {
+                    if let Some(tn) = &var.type_name {
+                        if *tn == name {
+                            let _ = self.error_at(CompileError::UndefinedStructure, &var);
+                        }
+                    }
+                }
+
                 let size = self.field_size(var.nw_type, &var.type_name);
                 fields.push(FieldInfo {
                     name: field_name,
@@ -486,8 +506,13 @@ impl<'a> SemanticChecker<'a> {
         while param_node != NULL_NODE {
             let p = self.arena.get(param_node).clone();
             if p.op == Operation::FunctionParamName {
+                let pname = p.string_data.as_deref().unwrap_or("").to_string();
+                // Detect duplicate parameter names
+                if params.iter().any(|existing: &ParamInfo| existing.name == pname) {
+                    let _ = self.error_at(CompileError::VariableAlreadyUsedWithinScope, &p);
+                }
                 params.push(ParamInfo {
-                    name: p.string_data.as_deref().unwrap_or("").to_string(),
+                    name: pname,
                     nw_type: p.nw_type,
                     type_name: p.type_name.clone(),
                     has_default: p.left != NULL_NODE,
@@ -1163,6 +1188,21 @@ impl<'a> SemanticChecker<'a> {
             }
 
             Operation::Assignment => {
+                // Check if assigning to a const
+                if node.left != NULL_NODE {
+                    let lhs = self.arena.get(node.left).clone();
+                    if lhs.op == Operation::Variable {
+                        let name = lhs.string_data.as_deref().unwrap_or("");
+                        let is_const = self.var_stack.iter().rev().find(|v| v.name == name)
+                            .map(|v| v.is_constant)
+                            .or_else(|| self.globals.iter().find(|v| v.name == name).map(|v| v.is_constant))
+                            .unwrap_or(false);
+                        if is_const {
+                            self.error_at(CompileError::InvalidValueAssignedToConstant, &node)?;
+                        }
+                    }
+                }
+
                 let left_type = self.check_expression(node.left)?;
                 let right_type = self.check_expression(node.right)?;
                 if left_type != right_type
@@ -1224,8 +1264,29 @@ impl<'a> SemanticChecker<'a> {
             Operation::ConditionEqual | Operation::ConditionNotEqual
             | Operation::ConditionGEQ | Operation::ConditionGT
             | Operation::ConditionLT | Operation::ConditionLEQ => {
-                self.check_expression(node.left)?;
-                self.check_expression(node.right)?;
+                let lt = self.check_expression(node.left)?;
+                let rt = self.check_expression(node.right)?;
+
+                // Validate operand types
+                if lt != NwType::Void && rt != NwType::Void {
+                    let is_equality = matches!(
+                        node.op,
+                        Operation::ConditionEqual | Operation::ConditionNotEqual
+                    );
+                    // Equality: types must match exactly (or int<->float promotion)
+                    // Ordering: only int/float allowed
+                    let compatible = lt == rt
+                        || (matches!(lt, NwType::Integer | NwType::Float)
+                            && matches!(rt, NwType::Integer | NwType::Float));
+                    if !compatible {
+                        let err = if is_equality {
+                            CompileError::EqualityTestHasInvalidOperands
+                        } else {
+                            CompileError::ComparisonTestHasInvalidOperands
+                        };
+                        self.error_at(err, &node)?;
+                    }
+                }
                 Ok(NwType::Integer)
             }
 
