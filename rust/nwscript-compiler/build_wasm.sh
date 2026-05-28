@@ -21,4 +21,4 @@ gzip -c pkg/nwscript_compiler_bg.wasm | wc -c | awk '{printf "  %.1f KB\n", $1/1
 
 echo ""
 echo "Running WASM tests..."
-node test_wasm.js
+node tests/wasm_test.js

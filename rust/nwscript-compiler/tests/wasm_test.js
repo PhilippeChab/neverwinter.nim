@@ -1,4 +1,4 @@
-const { WasmCompiler } = require('./pkg/nwscript_compiler.js');
+const { WasmCompiler } = require('../pkg/nwscript_compiler.js');
 
 const LANG_SPEC = `
 int IntFn(int n);

@@ -73,7 +73,7 @@ wasm-bindgen --target nodejs --out-dir pkg \
     target/wasm32-unknown-unknown/release/nwscript_compiler.wasm
 
 # Run WASM tests
-node test_wasm.js
+node tests/wasm_test.js
 ```
 
 Requires:
