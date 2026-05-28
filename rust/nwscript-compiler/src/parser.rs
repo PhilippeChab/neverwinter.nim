@@ -315,6 +315,10 @@ impl Parser {
         let tok = self.peek().clone();
         self.expect(TokenType::KeywordConst)?;
         let type_info = self.parse_type_specifier()?;
+        // C++: const only valid on int, float, string
+        if !matches!(type_info.0, NwType::Integer | NwType::Float | NwType::String) {
+            self.error(CompileError::InvalidTypeForConstKeyword, &tok);
+        }
         let name_tok = self.advance().clone();
         if name_tok.token_type != TokenType::Identifier {
             return Err(CompileError::BadVariableName);
@@ -822,8 +826,11 @@ impl Parser {
 
     fn parse_local_declaration(&mut self) -> Result<NodeId, CompileError> {
         let is_const = self.peek_type() == TokenType::KeywordConst;
+        let const_tok = self.peek().clone();
         if is_const {
             self.advance();
+            // C++ rejects const on non-global variables
+            self.error(CompileError::ConstKeywordCannotBeUsedOnNonGlobalVariables, &const_tok);
         }
 
         let type_info = self.parse_type_specifier()?;

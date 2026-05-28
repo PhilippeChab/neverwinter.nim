@@ -456,7 +456,12 @@ impl<'a> SemanticChecker<'a> {
             .unwrap_or("")
             .to_string();
 
-        let mut fields = Vec::new();
+        // Detect struct redefinition (C++ matches by name)
+        if self.structs.iter().any(|s| s.name == name) {
+            let _ = self.error_at(CompileError::StructureRedefined, def_node);
+        }
+
+        let mut fields: Vec<FieldInfo> = Vec::new();
         let mut offset = 0;
         let mut field_chain = def_node.left;
 
@@ -473,6 +478,11 @@ impl<'a> SemanticChecker<'a> {
                             let _ = self.error_at(CompileError::UndefinedStructure, &var);
                         }
                     }
+                }
+
+                // Detect duplicate field names
+                if fields.iter().any(|f| f.name == field_name) {
+                    let _ = self.error_at(CompileError::VariableUsedTwiceInSameStructure, &var);
                 }
 
                 let size = self.field_size(var.nw_type, &var.type_name);
@@ -870,9 +880,8 @@ impl<'a> SemanticChecker<'a> {
                             CompileError::ReturnTypeAndFunctionTypeMismatched,
                             &node,
                         )?;
-                    } else if ret_type != self.current_return_type
-                        && ret_type != NwType::Void
-                    {
+                    } else if ret_type != self.current_return_type {
+                        // Match C++: no implicit conversion, void RHS is also a mismatch
                         self.error_at(
                             CompileError::ReturnTypeAndFunctionTypeMismatched,
                             &node,
@@ -974,7 +983,7 @@ impl<'a> SemanticChecker<'a> {
             let cond = self.arena.get(node.left).clone();
             if cond.left != NULL_NODE {
                 let t = self.check_expression(cond.left)?;
-                self.require_nonvoid(t, &cond)?;
+                self.require_integer_cond(t, &cond)?;
             }
         }
         if node.right != NULL_NODE {
@@ -993,7 +1002,7 @@ impl<'a> SemanticChecker<'a> {
             let cond = self.arena.get(node.left).clone();
             if cond.left != NULL_NODE {
                 let t = self.check_expression(cond.left)?;
-                self.require_nonvoid(t, &cond)?;
+                self.require_integer_cond(t, &cond)?;
             }
         }
         self.loop_depth += 1;
@@ -1005,16 +1014,15 @@ impl<'a> SemanticChecker<'a> {
         Ok(())
     }
 
-    fn require_nonvoid(&mut self, t: NwType, node: &AstNode) -> Result<(), CompileError> {
-        // The check_expression for an undefined function call also returns Void
-        // (after emitting UndefinedIdentifier), so we'd double-report. Only error
-        // if no prior errors were emitted on this exact node.
+    fn require_integer_cond(&mut self, t: NwType, node: &AstNode) -> Result<(), CompileError> {
+        // C++: conditions must evaluate to integer (not void, not float, not anything else)
         if t == NwType::Void {
-            // Only fire if this node hasn't already been flagged
             let already = self.diagnostics.iter().any(|d| d.line == node.line);
             if !already {
                 self.error_at(CompileError::VoidExpressionWhereNonVoidRequired, node)?;
             }
+        } else if t != NwType::Integer {
+            self.error_at(CompileError::NonIntegerExpressionWhereIntegerRequired, node)?;
         }
         Ok(())
     }
@@ -1027,7 +1035,8 @@ impl<'a> SemanticChecker<'a> {
         if node.right != NULL_NODE {
             let cond = self.arena.get(node.right).clone();
             if cond.left != NULL_NODE {
-                self.check_expression(cond.left)?;
+                let t = self.check_expression(cond.left)?;
+                self.require_integer_cond(t, &cond)?;
             }
         }
         Ok(())
@@ -1227,11 +1236,17 @@ impl<'a> SemanticChecker<'a> {
 
                 let left_type = self.check_expression(node.left)?;
                 let right_type = self.check_expression(node.right)?;
-                if left_type != right_type
-                    && left_type != NwType::Void
-                    && right_type != NwType::Void
-                {
-                    self.error_at(CompileError::MismatchedTypes, &node)?;
+                // Only skip the check if the LEFT side is Void (target unknown — likely error already reported).
+                // Void on the RIGHT (e.g. `int x = SomeVoidFn();`) is a real mismatch.
+                if left_type != NwType::Void {
+                    let types_match = if left_type == NwType::Struct && right_type == NwType::Struct {
+                        self.resolve_struct_name(node.left) == self.resolve_struct_name(node.right)
+                    } else {
+                        left_type == right_type
+                    };
+                    if !types_match {
+                        self.error_at(CompileError::MismatchedTypes, &node)?;
+                    }
                 }
                 Ok(left_type)
             }
@@ -1261,25 +1276,53 @@ impl<'a> SemanticChecker<'a> {
             }
 
             Operation::Negation => {
+                // Unary - requires int or float per C++
                 let t = self.check_expression(node.left)?;
+                if t != NwType::Void && t != NwType::Integer && t != NwType::Float {
+                    self.error_at(CompileError::ArithmeticOperationHasInvalidOperands, &node)?;
+                }
                 Ok(t)
             }
 
             Operation::BooleanNot | Operation::OnesComplement => {
-                self.check_expression(node.left)?;
+                // ! and ~ require integer operand per C++
+                let t = self.check_expression(node.left)?;
+                if t != NwType::Void && t != NwType::Integer {
+                    self.error_at(CompileError::NonIntegerExpressionWhereIntegerRequired, &node)?;
+                }
                 Ok(NwType::Integer)
             }
 
             Operation::LogicalAnd | Operation::LogicalOr => {
-                self.check_expression(node.left)?;
-                self.check_expression(node.right)?;
+                let lt = self.check_expression(node.left)?;
+                let rt = self.check_expression(node.right)?;
+                if (lt != NwType::Void && lt != NwType::Integer)
+                    || (rt != NwType::Void && rt != NwType::Integer)
+                {
+                    self.error_at(CompileError::LogicalOperationHasInvalidOperands, &node)?;
+                }
                 Ok(NwType::Integer)
             }
 
-            Operation::InclusiveOr | Operation::ExclusiveOr | Operation::BooleanAnd
-            | Operation::ShiftLeft | Operation::ShiftRight | Operation::UnsignedShiftRight => {
-                self.check_expression(node.left)?;
-                self.check_expression(node.right)?;
+            Operation::InclusiveOr | Operation::ExclusiveOr | Operation::BooleanAnd => {
+                let lt = self.check_expression(node.left)?;
+                let rt = self.check_expression(node.right)?;
+                if (lt != NwType::Void && lt != NwType::Integer)
+                    || (rt != NwType::Void && rt != NwType::Integer)
+                {
+                    self.error_at(CompileError::LogicalOperationHasInvalidOperands, &node)?;
+                }
+                Ok(NwType::Integer)
+            }
+
+            Operation::ShiftLeft | Operation::ShiftRight | Operation::UnsignedShiftRight => {
+                let lt = self.check_expression(node.left)?;
+                let rt = self.check_expression(node.right)?;
+                if (lt != NwType::Void && lt != NwType::Integer)
+                    || (rt != NwType::Void && rt != NwType::Integer)
+                {
+                    self.error_at(CompileError::ShiftOperationHasInvalidOperands, &node)?;
+                }
                 Ok(NwType::Integer)
             }
 
@@ -1289,24 +1332,27 @@ impl<'a> SemanticChecker<'a> {
                 let lt = self.check_expression(node.left)?;
                 let rt = self.check_expression(node.right)?;
 
-                // Validate operand types
+                // Validate operand types — match C++ behavior strictly (no int↔float promotion)
                 if lt != NwType::Void && rt != NwType::Void {
                     let is_equality = matches!(
                         node.op,
                         Operation::ConditionEqual | Operation::ConditionNotEqual
                     );
                     if is_equality {
-                        // Equality: types must match (or int<->float promotion)
-                        let ok = lt == rt
-                            || (matches!(lt, NwType::Integer | NwType::Float)
-                                && matches!(rt, NwType::Integer | NwType::Float));
+                        // Equality: types must match exactly. For structs, names must match.
+                        let ok = if lt == NwType::Struct && rt == NwType::Struct {
+                            self.resolve_struct_name(node.left) == self.resolve_struct_name(node.right)
+                        } else {
+                            lt == rt
+                        };
                         if !ok {
                             self.error_at(CompileError::EqualityTestHasInvalidOperands, &node)?;
                         }
                     } else {
-                        // Ordering (<, >, <=, >=): only int/float
-                        let numeric = |t| matches!(t, NwType::Integer | NwType::Float);
-                        if !numeric(lt) || !numeric(rt) {
+                        // Ordering (<, >, <=, >=): only (int,int) or (float,float)
+                        let ok = (lt == NwType::Integer && rt == NwType::Integer)
+                            || (lt == NwType::Float && rt == NwType::Float);
+                        if !ok {
                             self.error_at(CompileError::ComparisonTestHasInvalidOperands, &node)?;
                         }
                     }
@@ -1316,7 +1362,18 @@ impl<'a> SemanticChecker<'a> {
 
             Operation::PostIncrement | Operation::PostDecrement
             | Operation::PreIncrement | Operation::PreDecrement => {
-                self.check_expression(node.left)?;
+                let t = self.check_expression(node.left)?;
+                // C++: ++/-- requires integer lvalue
+                if t != NwType::Void && t != NwType::Integer {
+                    self.error_at(CompileError::OperandMustBeAnIntegerLValue, &node)?;
+                }
+                // Also require an lvalue (variable or struct field)
+                if node.left != NULL_NODE {
+                    let lhs = self.arena.get(node.left).clone();
+                    if !matches!(lhs.op, Operation::Variable | Operation::StructurePart) {
+                        self.error_at(CompileError::OperandMustBeAnIntegerLValue, &node)?;
+                    }
+                }
                 Ok(NwType::Integer)
             }
 
@@ -1352,8 +1409,11 @@ impl<'a> SemanticChecker<'a> {
                     return Ok(NwType::Void);
                 }
 
-                // Engine structures can have field access too (e.g. effect properties)
-                // Don't error — just return Void for unknown field access
+                // C++ rejects `.` on non-struct/non-vector types.
+                // Allow Void silently (means upstream already errored).
+                if struct_type != NwType::Void {
+                    self.error_at(CompileError::LeftOfStructurePartNotStructure, &node)?;
+                }
                 Ok(NwType::Void)
             }
 

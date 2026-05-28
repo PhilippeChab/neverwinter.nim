@@ -485,7 +485,9 @@ impl Compiler {
             return;
         }
 
-        if include_stack.contains(&inc_name.to_string()) {
+        // Match C++: filename comparison is case-insensitive (CompareNoCase)
+        let inc_lower = inc_name.to_lowercase();
+        if include_stack.iter().any(|s| s.to_lowercase() == inc_lower) {
             diagnostics.push(Diagnostic {
                 error: CompileError::IncludeRecursive,
                 severity: Severity::Error,
@@ -496,7 +498,7 @@ impl Compiler {
             return;
         }
 
-        if included_set.contains(inc_name) {
+        if included_set.iter().any(|s| s.to_lowercase() == inc_lower) {
             return;
         }
 
