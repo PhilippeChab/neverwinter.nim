@@ -1,26 +1,52 @@
 use std::fmt::Write;
 
-#[derive(Debug, Clone)]
-pub struct NdbLineEntry {
-    pub file_id: u32,
-    pub line: u32,
-    pub code_start: u32,
-    pub code_end: u32,
+/// Type abbreviations used in NDB output, matching GenerateDebuggerTypeAbbreviation
+/// in the C++ compiler.
+fn type_abbrev(nw_type: crate::types::NwType, struct_name: &str) -> String {
+    use crate::types::NwType;
+    match nw_type {
+        NwType::Void => "v".to_string(),
+        NwType::Integer => "i".to_string(),
+        NwType::Float => "f".to_string(),
+        NwType::String => "s".to_string(),
+        NwType::Object => "o".to_string(),
+        NwType::Vector => "vec".to_string(),
+        NwType::Action => "v".to_string(),
+        NwType::EngineStructure(n) => format!("e{}", n),
+        NwType::Struct => format!("struct {}", struct_name),
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct NdbFunctionEntry {
     pub name: String,
+    pub return_type: crate::types::NwType,
+    pub return_struct_name: String,
     pub code_start: u32,
     pub code_end: u32,
-    pub return_type: String,
+    pub params: Vec<(crate::types::NwType, String)>,
 }
 
 #[derive(Debug, Clone)]
 pub struct NdbVarEntry {
     pub name: String,
-    pub var_type: String,
-    pub stack_offset: i32,
+    pub var_type: crate::types::NwType,
+    pub struct_name: String,
+    pub stack_loc: u32,
+    pub code_start: u32,
+    pub code_end: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct NdbStructDef {
+    pub name: String,
+    pub fields: Vec<(String, crate::types::NwType, String)>, // (name, type, struct_name)
+}
+
+#[derive(Debug, Clone)]
+pub struct NdbLineEntry {
+    pub file_id: u8,
+    pub line: u32,
     pub code_start: u32,
     pub code_end: u32,
 }
@@ -28,6 +54,8 @@ pub struct NdbVarEntry {
 #[derive(Debug, Default)]
 pub struct NdbBuilder {
     pub files: Vec<String>,
+    pub base_file: Option<String>,
+    pub structs: Vec<NdbStructDef>,
     pub functions: Vec<NdbFunctionEntry>,
     pub variables: Vec<NdbVarEntry>,
     pub line_entries: Vec<NdbLineEntry>,
@@ -44,12 +72,20 @@ impl NdbBuilder {
         id
     }
 
+    pub fn set_base_file(&mut self, name: &str) {
+        self.base_file = Some(name.to_string());
+    }
+
     pub fn add_function(&mut self, entry: NdbFunctionEntry) {
         self.functions.push(entry);
     }
 
     pub fn add_variable(&mut self, entry: NdbVarEntry) {
         self.variables.push(entry);
+    }
+
+    pub fn add_struct(&mut self, def: NdbStructDef) {
+        self.structs.push(def);
     }
 
     pub fn add_line(&mut self, entry: NdbLineEntry) {
@@ -59,43 +95,70 @@ impl NdbBuilder {
     pub fn generate(&self) -> Vec<u8> {
         let mut out = String::new();
 
-        // NDB format: text-based debug info
-        // Line 1: NDB version
+        // Header
         writeln!(out, "NDB V1.0").unwrap();
 
-        // File list
-        writeln!(out, "N {}", self.files.len()).unwrap();
-        for f in &self.files {
-            writeln!(out, "F {}", f).unwrap();
+        // Counts line: file_count, struct_count, function_count, var_count, line_count
+        // Format: "%07d %07d %07d %07d %07d\n" (40 chars)
+        writeln!(
+            out,
+            "{:07} {:07} {:07} {:07} {:07}",
+            self.files.len(),
+            self.structs.len(),
+            self.functions.len(),
+            self.variables.len(),
+            self.line_entries.len(),
+        ).unwrap();
+
+        // File entries: "N%02d %s\n" for base, "n%02d %s\n" for others
+        for (i, name) in self.files.iter().enumerate() {
+            let prefix = if Some(name) == self.base_file.as_ref() { 'N' } else { 'n' };
+            writeln!(out, "{}{:02} {}", prefix, i, name).unwrap();
         }
 
-        // Function list
-        writeln!(out, "n {}", self.functions.len()).unwrap();
+        // Struct entries: "s %02d %s\n" then "sf <type> <name>\n" per field
+        for s in &self.structs {
+            writeln!(out, "s {:02} {}", s.fields.len(), s.name).unwrap();
+            for (fname, ftype, fstruct) in &s.fields {
+                writeln!(out, "sf {} {}", type_abbrev(*ftype, fstruct), fname).unwrap();
+            }
+        }
+
+        // Function entries: "f %08x %08x %03d <type> <name>\n" + "fp <type>\n" per param
         for f in &self.functions {
             writeln!(
                 out,
-                "f {} {} {} {}",
-                f.name, f.return_type, f.code_start, f.code_end
+                "f {:08x} {:08x} {:03} {} {}",
+                f.code_start,
+                f.code_end,
+                f.params.len(),
+                type_abbrev(f.return_type, &f.return_struct_name),
+                f.name,
             ).unwrap();
+            for (ptype, pstruct) in &f.params {
+                writeln!(out, "fp {}", type_abbrev(*ptype, pstruct)).unwrap();
+            }
         }
 
-        // Variable list
-        writeln!(out, "v {}", self.variables.len()).unwrap();
+        // Variable entries: "v %08x %08x %08x <type> <name>\n"
         for v in &self.variables {
             writeln!(
                 out,
-                "V {} {} {} {} {}",
-                v.name, v.var_type, v.stack_offset, v.code_start, v.code_end
+                "v {:08x} {:08x} {:08x} {} {}",
+                v.code_start,
+                v.code_end,
+                v.stack_loc,
+                type_abbrev(v.var_type, &v.struct_name),
+                v.name,
             ).unwrap();
         }
 
-        // Line number mappings
-        writeln!(out, "l {}", self.line_entries.len()).unwrap();
+        // Line number entries: "l %02d %08x %08x %08x\n" (file_id, line, code_start, code_end)
         for l in &self.line_entries {
             writeln!(
                 out,
-                "L {} {} {} {}",
-                l.file_id, l.line, l.code_start, l.code_end
+                "l {:02} {:08x} {:08x} {:08x}",
+                l.file_id, l.line, l.code_start, l.code_end,
             ).unwrap();
         }
 
@@ -106,68 +169,76 @@ impl NdbBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NwType;
 
     #[test]
     fn test_empty_ndb() {
-        let builder = NdbBuilder::new();
-        let ndb = builder.generate();
-        let text = String::from_utf8(ndb).unwrap();
-        assert!(text.starts_with("NDB V1.0"));
-        assert!(text.contains("N 0"));
-        assert!(text.contains("n 0"));
+        let b = NdbBuilder::new();
+        let s = String::from_utf8(b.generate()).unwrap();
+        assert!(s.starts_with("NDB V1.0\n"));
+        assert!(s.contains("0000000 0000000 0000000 0000000 0000000\n"));
     }
 
     #[test]
-    fn test_ndb_with_file() {
-        let mut builder = NdbBuilder::new();
-        builder.add_file("test.nss");
-        let ndb = builder.generate();
-        let text = String::from_utf8(ndb).unwrap();
-        assert!(text.contains("N 1"));
-        assert!(text.contains("F test.nss"));
+    fn test_ndb_with_base_file() {
+        let mut b = NdbBuilder::new();
+        b.add_file("test.nss");
+        b.set_base_file("test.nss");
+        let s = String::from_utf8(b.generate()).unwrap();
+        assert!(s.contains("N00 test.nss"));
     }
 
     #[test]
-    fn test_ndb_with_function() {
-        let mut builder = NdbBuilder::new();
-        builder.add_file("test.nss");
-        builder.add_function(NdbFunctionEntry {
+    fn test_ndb_with_included_file() {
+        let mut b = NdbBuilder::new();
+        b.add_file("main.nss");
+        b.add_file("lib.nss");
+        b.set_base_file("main.nss");
+        let s = String::from_utf8(b.generate()).unwrap();
+        assert!(s.contains("N00 main.nss"));
+        assert!(s.contains("n01 lib.nss"));
+    }
+
+    #[test]
+    fn test_ndb_function_entry() {
+        let mut b = NdbBuilder::new();
+        b.add_function(NdbFunctionEntry {
             name: "main".to_string(),
-            code_start: 13,
-            code_end: 25,
-            return_type: "v".to_string(),
+            return_type: NwType::Void,
+            return_struct_name: String::new(),
+            code_start: 0x0d,
+            code_end: 0x19,
+            params: vec![],
         });
-        let ndb = builder.generate();
-        let text = String::from_utf8(ndb).unwrap();
-        assert!(text.contains("f main v 13 25"));
+        let s = String::from_utf8(b.generate()).unwrap();
+        assert!(s.contains("f 0000000d 00000019 000 v main"));
     }
 
     #[test]
-    fn test_ndb_with_variable() {
-        let mut builder = NdbBuilder::new();
-        builder.add_variable(NdbVarEntry {
+    fn test_ndb_variable_entry() {
+        let mut b = NdbBuilder::new();
+        b.add_variable(NdbVarEntry {
             name: "x".to_string(),
-            var_type: "i".to_string(),
-            stack_offset: -4,
-            code_start: 15,
-            code_end: 25,
+            var_type: NwType::Integer,
+            struct_name: String::new(),
+            stack_loc: 0x10,
+            code_start: 0x0f,
+            code_end: 0x19,
         });
-        let ndb = builder.generate();
-        let text = String::from_utf8(ndb).unwrap();
-        assert!(text.contains("V x i -4 15 25"));
+        let s = String::from_utf8(b.generate()).unwrap();
+        assert!(s.contains("v 0000000f 00000019 00000010 i x"));
     }
 
     #[test]
-    fn test_ndb_with_line_entry() {
-        let mut builder = NdbBuilder::new();
-        builder.add_line(NdbLineEntry {
+    fn test_ndb_line_entry() {
+        let mut b = NdbBuilder::new();
+        b.add_line(NdbLineEntry {
             file_id: 0,
             line: 5,
-            code_start: 13,
-            code_end: 19,
+            code_start: 0x0d,
+            code_end: 0x13,
         });
-        let ndb = builder.generate();
-        let text = String::from_utf8(ndb).unwrap();
-        assert!(text.contains("L 0 5 13 19"));
+        let s = String::from_utf8(b.generate()).unwrap();
+        assert!(s.contains("l 00 00000005 0000000d 00000013"));
     }
 }

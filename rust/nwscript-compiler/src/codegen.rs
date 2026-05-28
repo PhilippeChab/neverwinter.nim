@@ -44,8 +44,12 @@ pub struct CodeGenerator<'a> {
     struct_defs: Vec<StructDef>,
     current_func_name: Option<String>,
     current_return_type: NwType,
+    current_return_slot_offset: i32,
+    optimization_level: u32,
+    reachable_functions: std::collections::HashSet<String>,
     loop_start_stack: Vec<usize>,
     break_fixup_stack: Vec<Vec<usize>>,
+    continue_fixup_stack: Vec<Vec<usize>>,
     has_globals: bool,
     global_var_size: i32,
 }
@@ -68,8 +72,12 @@ impl<'a> CodeGenerator<'a> {
             struct_defs: Vec::new(),
             current_func_name: None,
             current_return_type: NwType::Void,
+            current_return_slot_offset: 0,
+            optimization_level: 0,
+            reachable_functions: std::collections::HashSet::new(),
             loop_start_stack: Vec::new(),
             break_fixup_stack: Vec::new(),
+            continue_fixup_stack: Vec::new(),
             has_globals: false,
             global_var_size: 0,
         }
@@ -77,6 +85,10 @@ impl<'a> CodeGenerator<'a> {
 
     pub fn set_collect_all_errors(&mut self, v: bool) {
         self.collect_all_errors = v;
+    }
+
+    pub fn set_optimization_level(&mut self, level: u32) {
+        self.optimization_level = level;
     }
 
     pub fn load_symbols(&mut self, checker: &SemanticChecker) {
@@ -202,6 +214,11 @@ impl<'a> CodeGenerator<'a> {
 
         // Scan for globals
         self.has_globals = self.has_global_vars(root);
+
+        // Compute reachable functions for dead-function elimination
+        if self.optimization_level & 0x01 != 0 {
+            self.compute_reachable_functions(root);
+        }
 
         // Emit loader
         self.emit_loader(root)?;
@@ -350,9 +367,74 @@ impl<'a> CodeGenerator<'a> {
             return Ok(());
         }
         if node.op == Operation::Function {
+            // Dead function elimination
+            if self.optimization_level & 0x01 != 0 {
+                if let Some(fid_node) = self.arena.try_get(node.left) {
+                    let name = fid_node.string_data.as_deref().unwrap_or("");
+                    if !self.reachable_functions.contains(name) {
+                        return Ok(());
+                    }
+                }
+            }
             self.emit_function(node_id)?;
         }
         Ok(())
+    }
+
+    fn compute_reachable_functions(&mut self, root: NodeId) {
+        let entry = self.entry_point_name().to_string();
+        let mut worklist = vec![entry];
+        if self.has_globals {
+            worklist.push("#globals".to_string());
+        }
+
+        while let Some(name) = worklist.pop() {
+            if !self.reachable_functions.insert(name.clone()) {
+                continue;
+            }
+            // Find function body and collect called functions
+            if let Some(body) = self.find_function_body(root, &name) {
+                let mut called = Vec::new();
+                self.collect_calls(body, &mut called);
+                for c in called {
+                    if !self.reachable_functions.contains(&c) {
+                        worklist.push(c);
+                    }
+                }
+            }
+        }
+    }
+
+    fn find_function_body(&self, node_id: NodeId, name: &str) -> Option<NodeId> {
+        if node_id == NULL_NODE { return None; }
+        let node = self.arena.get(node_id);
+        if node.op == Operation::FunctionalUnit {
+            if let Some(b) = self.find_function_body(node.left, name) { return Some(b); }
+            return self.find_function_body(node.right, name);
+        }
+        if node.op == Operation::Function && node.left != NULL_NODE {
+            let fid = self.arena.get(node.left);
+            if fid.string_data.as_deref() == Some(name) {
+                return Some(node.right);
+            }
+        }
+        None
+    }
+
+    fn collect_calls(&self, node_id: NodeId, out: &mut Vec<String>) {
+        if node_id == NULL_NODE { return; }
+        let node = self.arena.get(node_id);
+        if node.op == Operation::Action && node.left != NULL_NODE {
+            let aid = self.arena.get(node.left);
+            if let Some(n) = &aid.string_data {
+                // Only collect user functions, not engine actions
+                if self.func_sigs.iter().any(|f| f.name == *n && !f.is_engine_action) {
+                    out.push(n.clone());
+                }
+            }
+        }
+        self.collect_calls(node.left, out);
+        self.collect_calls(node.right, out);
     }
 
     fn emit_function(&mut self, node_id: NodeId) -> Result<(), CompileError> {
@@ -395,6 +477,11 @@ impl<'a> CodeGenerator<'a> {
             });
             param_offset += size;
         }
+
+        // Track where the caller's reserved return slot is, relative to function entry.
+        // Caller pushed RUNSTACK_ADD before args, so the return slot is below all params.
+        let return_size = self.type_size(return_type, &fid.type_name.clone());
+        self.current_return_slot_offset = -total_param_size - return_size;
 
         // Generate function body
         if node.right != NULL_NODE {
@@ -473,7 +560,15 @@ impl<'a> CodeGenerator<'a> {
             }
             Operation::Continue => {
                 if let Some(&target) = self.loop_start_stack.last() {
-                    self.emit_jmp_to(Opcode::Jmp, target);
+                    if target == usize::MAX {
+                        // For-loop: continue jumps to update expression — register a fixup
+                        let fix = self.emit_jmp_placeholder(Opcode::Jmp);
+                        if let Some(fixups) = self.continue_fixup_stack.last_mut() {
+                            fixups.push(fix);
+                        }
+                    } else {
+                        self.emit_jmp_to(Opcode::Jmp, target);
+                    }
                 }
             }
             _ => { self.generate_expr(node_id)?; }
@@ -539,8 +634,29 @@ impl<'a> CodeGenerator<'a> {
     fn gen_while(&mut self, node_id: NodeId) -> Result<(), CompileError> {
         let node = self.arena.get(node_id).clone();
         let loop_top = self.pos();
-        self.loop_start_stack.push(loop_top);
+
+        // For-loop detection: extract the WhileContinue (update) node if present
+        // so we can use it as the continue target instead of loop_top
+        let (body_root, update_node) = self.extract_for_update(node.right);
+
+        // Push continue target placeholder — we'll update it after we know where update is.
+        // For now use loop_top; if there's no update, that's correct.
+        let continue_target_placeholder = if update_node != NULL_NODE {
+            // We'll patch after we emit the update
+            usize::MAX
+        } else {
+            loop_top
+        };
+        self.loop_start_stack.push(continue_target_placeholder);
         self.break_fixup_stack.push(Vec::new());
+        // Track break fixups also for continue if it's a for-loop
+        // (continue jumps to update which is after body but before back-jump)
+        let continue_fixups_idx = if update_node != NULL_NODE {
+            self.continue_fixup_stack.push(Vec::new());
+            Some(self.continue_fixup_stack.len() - 1)
+        } else {
+            None
+        };
 
         if node.left != NULL_NODE {
             let cond = self.arena.get(node.left).clone();
@@ -549,16 +665,71 @@ impl<'a> CodeGenerator<'a> {
         let jz = self.emit_jmp_placeholder(Opcode::Jz);
         self.stack_depth -= 1;
 
-        if node.right != NULL_NODE {
-            let choice = self.arena.get(node.right).clone();
-            self.generate_stmt(choice.left)?;
+        // Body
+        if body_root != NULL_NODE {
+            self.generate_stmt(body_root)?;
         }
+
+        // Update (continue target for for-loops)
+        if update_node != NULL_NODE {
+            let update_pos = self.pos();
+            // Patch continue fixups to jump here
+            if let Some(idx) = continue_fixups_idx {
+                let fixups = std::mem::take(&mut self.continue_fixup_stack[idx]);
+                for f in fixups {
+                    self.patch_jmp_here(f);
+                }
+                // Also update loop_start_stack so any nested continue uses update_pos
+                if let Some(top) = self.loop_start_stack.last_mut() {
+                    *top = update_pos;
+                }
+            }
+            // Emit the update expression
+            let upd = self.arena.get(update_node).clone();
+            if upd.left != NULL_NODE {
+                self.generate_expr(upd.left)?;
+            }
+        }
+
         self.emit_jmp_to(Opcode::Jmp, loop_top);
         self.patch_jmp_here(jz);
 
         for f in self.break_fixup_stack.pop().unwrap_or_default() { self.patch_jmp_here(f); }
+        if continue_fixups_idx.is_some() {
+            self.continue_fixup_stack.pop();
+        }
         self.loop_start_stack.pop();
         Ok(())
+    }
+
+    /// If the while body is a desugared for-loop, split out the WhileContinue.
+    /// Returns (body_without_update, update_node).
+    fn extract_for_update(&self, choice_node: NodeId) -> (NodeId, NodeId) {
+        if choice_node == NULL_NODE { return (NULL_NODE, NULL_NODE); }
+        let choice = self.arena.get(choice_node);
+        // choice.left is CompoundStatement
+        if choice.left == NULL_NODE { return (choice_node, NULL_NODE); }
+        let cs = self.arena.get(choice.left);
+        if cs.op != Operation::CompoundStatement { return (choice_node, NULL_NODE); }
+        // cs.left is StatementList: [body, [WhileContinue]]
+        let sl = cs.left;
+        if sl == NULL_NODE { return (choice_node, NULL_NODE); }
+        let sl_node = self.arena.get(sl);
+        if sl_node.op != Operation::StatementList { return (choice_node, NULL_NODE); }
+        // Right side should be another StatementList wrapping WhileContinue
+        let right_sl = sl_node.right;
+        if right_sl == NULL_NODE { return (choice_node, NULL_NODE); }
+        let right_node = self.arena.get(right_sl);
+        if right_node.op != Operation::StatementList { return (choice_node, NULL_NODE); }
+        let candidate = right_node.left;
+        if candidate == NULL_NODE { return (choice_node, NULL_NODE); }
+        let cand_node = self.arena.get(candidate);
+        if cand_node.op == Operation::WhileContinue {
+            // body is sl_node.left only
+            (sl_node.left, candidate)
+        } else {
+            (choice_node, NULL_NODE)
+        }
     }
 
     fn gen_do_while(&mut self, node_id: NodeId) -> Result<(), CompileError> {
@@ -655,8 +826,21 @@ impl<'a> CodeGenerator<'a> {
     fn gen_return(&mut self, node_id: NodeId) -> Result<(), CompileError> {
         let node = self.arena.get(node_id).clone();
         if node.left != NULL_NODE {
+            let ret_size = self.type_size(self.current_return_type, &None);
             self.generate_expr(node.left)?;
-            // Store return value and clean stack
+
+            // Copy return value to caller's reserved slot.
+            // The slot offset was computed relative to function entry SP=0;
+            // adjust for current SP which includes the just-pushed return value.
+            if ret_size > 0 {
+                let target_offset = self.current_return_slot_offset - self.stack_depth * 4;
+                self.emit_op(Opcode::Assignment, 0);
+                self.emit_i32(target_offset);
+                self.emit_u16(ret_size as u16);
+                // The just-pushed value gets consumed by the ASSIGNMENT? In NWScript VM,
+                // ASSIGNMENT copies but doesn't pop. Pop it manually.
+                self.emit_modify_sp(-ret_size);
+            }
         }
         // Clean up local variables
         let local_size: i32 = self.locals.iter()
@@ -701,12 +885,9 @@ impl<'a> CodeGenerator<'a> {
                 Ok(NwType::Vector)
             }
             Operation::ConstantJson => {
-                self.emit_op(Opcode::Constant, 0x17);
-                let json_type = node.int_data[0];
-                // JSON_NULL=0, JSON_FALSE=1, JSON_TRUE=2, JSON_OBJECT=3, JSON_ARRAY=4, JSON_STRING=5
-                self.emit_str(match json_type {
-                    _ => "",
-                });
+                self.emit_op(Opcode::Constant, 0x17); // ENGST7 = json
+                let payload = node.string_data.as_deref().unwrap_or("");
+                self.emit_str(payload);
                 self.stack_depth += 1;
                 Ok(NwType::EngineStructure(7))
             }
@@ -889,12 +1070,10 @@ impl<'a> CodeGenerator<'a> {
             }
 
             // ---- Increment/Decrement ----
-            Operation::PostIncrement | Operation::PreIncrement => {
-                self.gen_inc_dec(node_id, Opcode::Increment)
-            }
-            Operation::PostDecrement | Operation::PreDecrement => {
-                self.gen_inc_dec(node_id, Opcode::Decrement)
-            }
+            Operation::PreIncrement => self.gen_inc_dec(node_id, Opcode::Increment, true),
+            Operation::PostIncrement => self.gen_inc_dec(node_id, Opcode::Increment, false),
+            Operation::PreDecrement => self.gen_inc_dec(node_id, Opcode::Decrement, true),
+            Operation::PostDecrement => self.gen_inc_dec(node_id, Opcode::Decrement, false),
 
             // ---- Function call ----
             Operation::Action => self.gen_call(node_id),
@@ -940,16 +1119,32 @@ impl<'a> CodeGenerator<'a> {
         Ok(())
     }
 
-    fn gen_inc_dec(&mut self, node_id: NodeId, opcode: Opcode) -> Result<NwType, CompileError> {
+    fn gen_inc_dec(&mut self, node_id: NodeId, opcode: Opcode, is_pre: bool) -> Result<NwType, CompileError> {
         let node = self.arena.get(node_id).clone();
         if node.left != NULL_NODE {
             let lhs = self.arena.get(node.left).clone();
             if lhs.op == Operation::Variable {
                 let name = lhs.string_data.as_deref().unwrap_or("");
-                if let Some((so, _, _, _)) = self.find_local(name) {
+                if let Some((so, sz, _, _)) = self.find_local(name) {
+                    if !is_pre {
+                        // post: push old value first
+                        let offset = so - self.stack_depth * 4;
+                        self.emit_op(Opcode::RunstackCopy, 0);
+                        self.emit_i32(offset);
+                        self.emit_u16(sz as u16);
+                        self.stack_depth += sz / 4;
+                    }
                     let offset = so - self.stack_depth * 4;
                     self.emit_op(opcode, 0x03);
                     self.emit_i32(offset);
+                    if is_pre {
+                        // pre: push new value after increment
+                        let offset = so - self.stack_depth * 4;
+                        self.emit_op(Opcode::RunstackCopy, 0);
+                        self.emit_i32(offset);
+                        self.emit_u16(sz as u16);
+                        self.stack_depth += sz / 4;
+                    }
                 }
             }
         }
@@ -962,26 +1157,34 @@ impl<'a> CodeGenerator<'a> {
         let aid = self.arena.get(node.left).clone();
         let func_name = aid.string_data.as_deref().unwrap_or("").to_string();
 
-        // Generate arguments
+        // Generate arguments, tracking each one's type for proper stack cleanup
         let mut arg_count = 0u8;
+        let mut arg_types: Vec<NwType> = Vec::new();
         let mut arg_node = aid.right;
         while arg_node != NULL_NODE {
             let arg = self.arena.get(arg_node).clone();
             if arg.left != NULL_NODE {
-                self.generate_expr(arg.left)?;
+                let t = self.generate_expr(arg.left)?;
+                arg_types.push(t);
                 arg_count += 1;
             }
             arg_node = arg.right;
         }
+
+        let arg_byte_size: i32 = arg_types.iter()
+            .map(|t| self.type_size(*t, &None))
+            .sum();
+        let arg_slot_count: i32 = arg_byte_size / 4;
 
         // Check if it's an engine function
         if let Some((action_id, sig)) = self.find_engine_func(&func_name).map(|(id, s)| (id, s.clone())) {
             self.emit_op(Opcode::ExecuteCommand, 0);
             self.emit_u16(action_id);
             self.emit(arg_count);
-            self.stack_depth -= arg_count as i32;
+            self.stack_depth -= arg_slot_count;
             if sig.return_type != NwType::Void {
-                self.stack_depth += 1;
+                let ret_slots = self.type_size(sig.return_type, &sig.return_type_name) / 4;
+                self.stack_depth += ret_slots;
             }
             return Ok(sig.return_type);
         }
@@ -990,16 +1193,18 @@ impl<'a> CodeGenerator<'a> {
         if let Some(sig) = self.find_user_func(&func_name).cloned() {
             // Reserve return value space if non-void
             if sig.return_type != NwType::Void {
-                self.emit_op(Opcode::RunstackAdd, sig.return_type.auxcode());
-                self.stack_depth += 1;
+                let ret_slots = self.type_size(sig.return_type, &sig.return_type_name) / 4;
+                for _ in 0..ret_slots {
+                    self.emit_op(Opcode::RunstackAdd, sig.return_type.auxcode());
+                    self.stack_depth += 1;
+                }
             }
 
             self.emit_jsr_label(&func_name);
 
-            // Clean up arguments
-            let arg_size = arg_count as i32 * 4;
-            if arg_size > 0 {
-                self.emit_modify_sp(-arg_size);
+            // Clean up arguments using actual sizes
+            if arg_byte_size > 0 {
+                self.emit_modify_sp(-arg_byte_size);
             }
             return Ok(sig.return_type);
         }
@@ -1008,7 +1213,7 @@ impl<'a> CodeGenerator<'a> {
         self.emit_op(Opcode::ExecuteCommand, 0);
         self.emit_u16(0);
         self.emit(arg_count);
-        self.stack_depth -= arg_count as i32;
+        self.stack_depth -= arg_slot_count;
         Ok(NwType::Void)
     }
 
@@ -1055,9 +1260,48 @@ impl<'a> CodeGenerator<'a> {
         Ok(NwType::Void)
     }
 
-    fn gen_struct_field_assign(&mut self, _lhs: &crate::ast::AstNode) -> Result<(), CompileError> {
-        // Struct field assignment is complex — requires computing the field offset
-        // and using a combination of DE_STRUCT + ASSIGNMENT. For now, this is a placeholder.
+    fn gen_struct_field_assign(&mut self, lhs: &crate::ast::AstNode) -> Result<(), CompileError> {
+        // lhs is a StructurePart node: lhs.left = struct expression, lhs.string_data = field name
+        // The new value is already pushed on the stack by the caller.
+        let field_name = lhs.string_data.as_deref().unwrap_or("");
+        if lhs.left == NULL_NODE { return Ok(()); }
+
+        let target = self.arena.get(lhs.left).clone();
+        if target.op != Operation::Variable {
+            return Ok(()); // chained field assignment not yet supported
+        }
+
+        let var_name = target.string_data.as_deref().unwrap_or("");
+        let (so, _struct_sz, _, type_name) = match self.find_local(var_name) {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+
+        // Determine field offset and size
+        let (field_off, field_sz) = if let Some(tn) = &type_name {
+            if let Some((off, sz, _)) = self.struct_field_offset(tn, field_name) {
+                (off, sz)
+            } else {
+                return Ok(());
+            }
+        } else {
+            // Vector: x=0/4, y=4/4, z=8/4
+            match field_name {
+                "x" => (0i32, 4i32),
+                "y" => (4, 4),
+                "z" => (8, 4),
+                _ => return Ok(()),
+            }
+        };
+
+        // ASSIGNMENT instruction:
+        // - offset is relative to current SP, pointing to the field location
+        //   struct base is at `so`, field is at `so + field_off`
+        // - the value to assign is on top of stack
+        let target_offset = so + field_off - self.stack_depth * 4;
+        self.emit_op(Opcode::Assignment, 0);
+        self.emit_i32(target_offset);
+        self.emit_u16(field_sz as u16);
         Ok(())
     }
 }

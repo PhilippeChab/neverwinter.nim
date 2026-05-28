@@ -78,6 +78,109 @@ struct ParsedFile {
     diagnostics: Vec<Diagnostic>,
 }
 
+/// Expand simple #define NAME VALUE macros and strip the directives.
+/// Doesn't handle function-like macros — NWScript only uses object-like ones.
+pub fn preprocess_defines(source: &str) -> String {
+    use std::collections::HashMap;
+    let mut macros: HashMap<String, String> = HashMap::new();
+    let mut out = String::with_capacity(source.len());
+
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("#define") {
+            let rest = rest.trim_start();
+            // Split into name and value
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            if let Some(name) = parts.next() {
+                let value = parts.next().unwrap_or("").trim().to_string();
+                if !name.is_empty() && is_valid_macro_name(name) {
+                    macros.insert(name.to_string(), value);
+                }
+            }
+            // Replace the line with blank so line numbers stay aligned
+            out.push('\n');
+            continue;
+        }
+
+        // Expand macros in this line — word-boundary aware
+        let expanded = expand_macros_in_line(line, &macros);
+        out.push_str(&expanded);
+        out.push('\n');
+    }
+    out
+}
+
+fn is_valid_macro_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn expand_macros_in_line(line: &str, macros: &std::collections::HashMap<String, String>) -> String {
+    if macros.is_empty() { return line.to_string(); }
+
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    let mut in_string = false;
+    let mut in_line_comment = false;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+
+        // Track string/comment state to avoid expansion inside them
+        if in_line_comment {
+            out.push(c as char);
+            i += 1;
+            continue;
+        }
+        if in_string {
+            out.push(c as char);
+            if c == b'"' && (i == 0 || bytes[i-1] != b'\\') {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'"' {
+            in_string = true;
+            out.push(c as char);
+            i += 1;
+            continue;
+        }
+        if c == b'/' && i + 1 < bytes.len() && bytes[i+1] == b'/' {
+            in_line_comment = true;
+            out.push('/');
+            i += 1;
+            continue;
+        }
+
+        // Try to match an identifier at this position
+        let is_ident_start = c.is_ascii_alphabetic() || c == b'_';
+        let prev_is_ident = i > 0 && (bytes[i-1].is_ascii_alphanumeric() || bytes[i-1] == b'_');
+
+        if is_ident_start && !prev_is_ident {
+            let mut end = i;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            let ident = &line[i..end];
+            if let Some(val) = macros.get(ident) {
+                out.push_str(val);
+                i = end;
+                continue;
+            }
+        }
+
+        out.push(c as char);
+        i += 1;
+    }
+    out
+}
+
 fn parse_engine_structure_defines(spec: &str) {
     let mut mappings: Vec<(u8, String)> = Vec::new();
     for line in spec.lines() {
@@ -213,6 +316,7 @@ impl Compiler {
         // Code generation
         let mut codegen = CodeGenerator::new(&main_parsed.arena, &main_parsed.file_names);
         codegen.set_collect_all_errors(self.options.collect_all_errors);
+        codegen.set_optimization_level(self.options.optimization_level);
         codegen.load_symbols(&checker);
         match codegen.generate(main_parsed.root) {
             Ok(mut ncs) => {
@@ -228,6 +332,7 @@ impl Compiler {
                 let ndb = if self.options.generate_debug {
                     let mut builder = NdbBuilder::new();
                     builder.add_file(filename);
+                    builder.set_base_file(filename);
                     builder.generate()
                 } else {
                     Vec::new()
@@ -259,7 +364,8 @@ impl Compiler {
     }
 
     fn parse_file(&self, source: &str, filename: &str) -> ParsedFile {
-        let mut lexer = Lexer::new(source, filename, 0);
+        let preprocessed = preprocess_defines(source);
+        let mut lexer = Lexer::new(&preprocessed, filename, 0);
         let tokens = lexer.tokenize();
         let mut diagnostics = lexer.diagnostics;
 

@@ -221,7 +221,7 @@ impl<'a> SemanticChecker<'a> {
             if vl.left != NULL_NODE {
                 let var = arena.get(vl.left).clone();
                 let field_name = var.string_data.as_deref().unwrap_or("").to_string();
-                let size = var.nw_type.size_bytes();
+                let size = self.field_size(var.nw_type, &var.type_name);
                 fields.push(FieldInfo {
                     name: field_name,
                     nw_type: var.nw_type,
@@ -234,6 +234,21 @@ impl<'a> SemanticChecker<'a> {
         }
 
         self.structs.push(StructDef { name, fields, byte_size: offset });
+    }
+
+    fn field_size(&self, nw_type: NwType, type_name: &Option<String>) -> i32 {
+        match nw_type {
+            NwType::Struct => {
+                if let Some(tn) = type_name {
+                    if let Some(sd) = self.structs.iter().find(|s| s.name == *tn) {
+                        return sd.byte_size;
+                    }
+                }
+                0
+            }
+            NwType::Vector => 12,
+            _ => nw_type.size_bytes(),
+        }
     }
 
     fn register_global_from_arena(&mut self, node: &AstNode, arena: &AstArena) {
@@ -440,7 +455,7 @@ impl<'a> SemanticChecker<'a> {
             if vl.left != NULL_NODE {
                 let var = self.arena.get(vl.left).clone();
                 let field_name = var.string_data.as_deref().unwrap_or("").to_string();
-                let size = var.nw_type.size_bytes();
+                let size = self.field_size(var.nw_type, &var.type_name);
                 fields.push(FieldInfo {
                     name: field_name,
                     nw_type: var.nw_type,
@@ -481,15 +496,40 @@ impl<'a> SemanticChecker<'a> {
             param_node = p.right;
         }
 
-        if let Some(existing) = self.functions.iter_mut().find(|f| f.name == name) {
+        let new_return = fid.nw_type;
+        let new_return_name = fid.type_name.clone();
+
+        let existing_idx = self.functions.iter().position(|f| f.name == name);
+        if let Some(idx) = existing_idx {
+            let return_matches = self.functions[idx].return_type == new_return
+                && self.functions[idx].return_type_name == new_return_name;
+            let params_match = self.functions[idx].params.len() == params.len()
+                && self.functions[idx].params.iter().zip(params.iter())
+                    .all(|(a, b)| a.nw_type == b.nw_type && a.type_name == b.type_name);
+
+            if !return_matches || !params_match {
+                let _ = self.error_at(
+                    CompileError::FunctionImplementationAndDefinitionDiffer,
+                    &fid,
+                );
+                return;
+            }
+
+            let already_implemented = self.functions[idx].has_implementation;
             if has_impl {
-                existing.has_implementation = true;
+                if already_implemented {
+                    let _ = self.error_at(
+                        CompileError::DuplicateFunctionImplementation,
+                        &fid,
+                    );
+                }
+                self.functions[idx].has_implementation = true;
             }
         } else {
             self.functions.push(FunctionSig {
                 name,
-                return_type: fid.nw_type,
-                return_type_name: fid.type_name.clone(),
+                return_type: new_return,
+                return_type_name: new_return_name,
                 params,
                 has_implementation: has_impl,
                 is_engine_action: false,
@@ -613,11 +653,102 @@ impl<'a> SemanticChecker<'a> {
             }
         }
 
+        // Check all paths return for non-void functions
+        if fid.nw_type != NwType::Void && body != NULL_NODE {
+            if !self.all_paths_return(body) {
+                let _ = self.error_at(
+                    CompileError::NotAllControlPathsReturnAValue,
+                    &fid,
+                );
+            }
+        }
+
         self.var_stack.truncate(saved_var_count);
         self.scope_level -= 1;
         self.current_function = None;
 
         Ok(())
+    }
+
+    fn all_paths_return(&self, node_id: NodeId) -> bool {
+        if node_id == NULL_NODE { return false; }
+        let node = self.arena.get(node_id);
+
+        match node.op {
+            Operation::Return => true,
+            Operation::CompoundStatement => self.all_paths_return(node.left),
+            Operation::StatementList => {
+                // If any child returns, the chain returns
+                self.all_paths_return(node.left) || self.all_paths_return(node.right)
+            }
+            Operation::Statement | Operation::StatementNoDebug => {
+                self.all_paths_return(node.left)
+            }
+            Operation::IfBlock => {
+                // Both then and else branches must return
+                if node.right == NULL_NODE { return false; }
+                let choice = self.arena.get(node.right);
+                if choice.right == NULL_NODE {
+                    // No else branch — could fall through
+                    return false;
+                }
+                self.all_paths_return(choice.left) && self.all_paths_return(choice.right)
+            }
+            Operation::SwitchBlock => {
+                // Conservatively: only if all cases return AND there's a default
+                self.switch_all_paths_return(node.right)
+            }
+            _ => false,
+        }
+    }
+
+    fn switch_all_paths_return(&self, node_id: NodeId) -> bool {
+        // Flatten the switch body and check for default + all-return
+        let mut has_default = false;
+        let mut all_return = true;
+        let mut in_case = false;
+        let mut case_has_return = false;
+        let mut items = Vec::new();
+        self.flatten_stmt_list(node_id, &mut items);
+
+        for &item in &items {
+            let n = self.arena.get(item);
+            match n.op {
+                Operation::Case => {
+                    if in_case && !case_has_return {
+                        all_return = false;
+                    }
+                    in_case = true;
+                    case_has_return = false;
+                }
+                Operation::Default => {
+                    if in_case && !case_has_return {
+                        all_return = false;
+                    }
+                    has_default = true;
+                    in_case = true;
+                    case_has_return = false;
+                }
+                _ => {
+                    if in_case && self.all_paths_return(item) {
+                        case_has_return = true;
+                    }
+                }
+            }
+        }
+        if in_case && !case_has_return { all_return = false; }
+        has_default && all_return
+    }
+
+    fn flatten_stmt_list(&self, node_id: NodeId, out: &mut Vec<NodeId>) {
+        if node_id == NULL_NODE { return; }
+        let node = self.arena.get(node_id);
+        if node.op == Operation::StatementList {
+            self.flatten_stmt_list(node.left, out);
+            self.flatten_stmt_list(node.right, out);
+        } else {
+            out.push(node_id);
+        }
     }
 
     fn check_statement(&mut self, node_id: NodeId) -> Result<(), CompileError> {
@@ -820,8 +951,72 @@ impl<'a> SemanticChecker<'a> {
             }
         }
         self.switch_depth += 1;
+
+        // Collect case values and detect duplicates + multiple defaults
+        let mut seen_cases: Vec<i32> = Vec::new();
+        let mut seen_default = false;
+        self.check_switch_cases(node.right, &mut seen_cases, &mut seen_default)?;
+
         self.check_statement(node.right)?;
         self.switch_depth -= 1;
+        Ok(())
+    }
+
+    fn check_switch_cases(
+        &mut self,
+        node_id: NodeId,
+        seen_cases: &mut Vec<i32>,
+        seen_default: &mut bool,
+    ) -> Result<(), CompileError> {
+        if node_id == NULL_NODE { return Ok(()); }
+        let node = self.arena.get(node_id).clone();
+
+        if node.op == Operation::StatementList {
+            self.check_switch_cases(node.left, seen_cases, seen_default)?;
+            self.check_switch_cases(node.right, seen_cases, seen_default)?;
+            return Ok(());
+        }
+
+        match node.op {
+            Operation::Case => {
+                if node.left != NULL_NODE {
+                    let val_node = self.arena.get(node.left).clone();
+                    match val_node.op {
+                        Operation::ConstantInteger => {
+                            let v = val_node.int_data[0];
+                            if seen_cases.contains(&v) {
+                                self.error_at(
+                                    CompileError::MultipleCaseConstantStatementsWithinSwitch,
+                                    &node,
+                                )?;
+                            } else {
+                                seen_cases.push(v);
+                            }
+                        }
+                        Operation::Variable | Operation::Negation => {
+                            // Const global reference or negated literal — accept,
+                            // can't track duplicate value without const folding.
+                        }
+                        _ => {
+                            self.error_at(
+                                CompileError::CaseParameterNotAConstantInteger,
+                                &node,
+                            )?;
+                        }
+                    }
+                }
+            }
+            Operation::Default => {
+                if *seen_default {
+                    self.error_at(
+                        CompileError::MultipleDefaultStatementsWithinSwitch,
+                        &node,
+                    )?;
+                }
+                *seen_default = true;
+            }
+            _ => {}
+        }
         Ok(())
     }
 

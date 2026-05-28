@@ -1209,6 +1209,17 @@ impl Parser {
             | TokenType::KeywordJsonObject | TokenType::KeywordJsonArray | TokenType::KeywordJsonString => {
                 self.advance();
                 let node = self.make_node_at(Operation::ConstantJson, &tok);
+                // Store the JSON literal payload as a string per the C++ compiler's CONSTANT_JSON op
+                let payload = match tok.token_type {
+                    TokenType::KeywordJsonNull => "null",
+                    TokenType::KeywordJsonFalse => "false",
+                    TokenType::KeywordJsonTrue => "true",
+                    TokenType::KeywordJsonObject => "{}",
+                    TokenType::KeywordJsonArray => "[]",
+                    TokenType::KeywordJsonString => "\"\"",
+                    _ => "",
+                };
+                self.arena.get_mut(node).string_data = Some(payload.to_string());
                 self.arena.get_mut(node).int_data[0] = tok.token_type as i32;
                 Ok(node)
             }
@@ -1285,6 +1296,28 @@ impl Parser {
                 self.arena.get_mut(arg1).right = arg2;
                 self.arena.get_mut(arg2).left = y;
                 let arg3 = self.make_node(Operation::ActionArgList);
+                self.arena.get_mut(arg2).right = arg3;
+                self.arena.get_mut(arg3).left = z;
+                self.arena.get_mut(node).left = arg1;
+                Ok(node)
+            }
+
+            TokenType::LeftSquareBracket => {
+                self.advance();
+                let x = self.parse_expression()?;
+                self.expect(TokenType::Comma)?;
+                let y = self.parse_expression()?;
+                self.expect(TokenType::Comma)?;
+                let z = self.parse_expression()?;
+                self.expect(TokenType::RightSquareBracket)?;
+                let node = self.make_node_at(Operation::ConstantVector, &tok);
+                self.arena.get_mut(node).nw_type = NwType::Vector;
+                let arg1 = self.make_node(Operation::ActionArgList);
+                let arg2 = self.make_node(Operation::ActionArgList);
+                let arg3 = self.make_node(Operation::ActionArgList);
+                self.arena.get_mut(arg1).left = x;
+                self.arena.get_mut(arg1).right = arg2;
+                self.arena.get_mut(arg2).left = y;
                 self.arena.get_mut(arg2).right = arg3;
                 self.arena.get_mut(arg3).left = z;
                 self.arena.get_mut(node).left = arg1;
