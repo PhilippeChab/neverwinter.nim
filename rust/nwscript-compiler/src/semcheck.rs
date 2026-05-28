@@ -557,6 +557,19 @@ impl<'a> SemanticChecker<'a> {
             if vl.left != NULL_NODE {
                 let var = self.arena.get(vl.left).clone();
                 let var_name = var.string_data.as_deref().unwrap_or("").to_string();
+
+                // Check initializer type matches declared type
+                if var.left != NULL_NODE {
+                    if let Some(init_type) = self.infer_const_type(var.left) {
+                        if init_type != nw_type
+                            && init_type != NwType::Void
+                            && nw_type != NwType::Void
+                        {
+                            let _ = self.error_at(CompileError::MismatchedTypes, &var);
+                        }
+                    }
+                }
+
                 self.globals.push(VarEntry {
                     name: var_name,
                     nw_type,
