@@ -197,7 +197,11 @@ impl Parser {
 
         let node = self.make_node_at(Operation::FunctionalUnit, &tok);
         let mut n = AstNode::new(Operation::FunctionalUnit);
-        n.string_data = Some(name_tok.text.clone());
+        // Strip optional .nss extension that some users include
+        let stripped = name_tok.text.strip_suffix(".nss")
+            .or_else(|| name_tok.text.strip_suffix(".NSS"))
+            .unwrap_or(&name_tok.text);
+        n.string_data = Some(stripped.to_string());
         n.file_id = tok.file_id;
         n.line = tok.line;
         n.col = tok.col;

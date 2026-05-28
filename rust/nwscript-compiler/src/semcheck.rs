@@ -878,6 +878,14 @@ impl<'a> SemanticChecker<'a> {
                             &node,
                         )?;
                     }
+                } else {
+                    // bare `return;` — invalid in non-void functions
+                    if self.current_return_type != NwType::Void {
+                        self.error_at(
+                            CompileError::ReturnStatementHasNoParameters,
+                            &node,
+                        )?;
+                    }
                 }
             }
             Operation::Break => {
@@ -962,14 +970,13 @@ impl<'a> SemanticChecker<'a> {
 
     fn check_if(&mut self, node_id: NodeId) -> Result<(), CompileError> {
         let node = self.arena.get(node_id).clone();
-        // IfCondition
         if node.left != NULL_NODE {
             let cond = self.arena.get(node.left).clone();
             if cond.left != NULL_NODE {
-                self.check_expression(cond.left)?;
+                let t = self.check_expression(cond.left)?;
+                self.require_nonvoid(t, &cond)?;
             }
         }
-        // IfChoice (left = then, right = else)
         if node.right != NULL_NODE {
             let choice = self.arena.get(node.right).clone();
             self.check_statement(choice.left)?;
@@ -985,7 +992,8 @@ impl<'a> SemanticChecker<'a> {
         if node.left != NULL_NODE {
             let cond = self.arena.get(node.left).clone();
             if cond.left != NULL_NODE {
-                self.check_expression(cond.left)?;
+                let t = self.check_expression(cond.left)?;
+                self.require_nonvoid(t, &cond)?;
             }
         }
         self.loop_depth += 1;
@@ -994,6 +1002,20 @@ impl<'a> SemanticChecker<'a> {
             self.check_statement(choice.left)?;
         }
         self.loop_depth -= 1;
+        Ok(())
+    }
+
+    fn require_nonvoid(&mut self, t: NwType, node: &AstNode) -> Result<(), CompileError> {
+        // The check_expression for an undefined function call also returns Void
+        // (after emitting UndefinedIdentifier), so we'd double-report. Only error
+        // if no prior errors were emitted on this exact node.
+        if t == NwType::Void {
+            // Only fire if this node hasn't already been flagged
+            let already = self.diagnostics.iter().any(|d| d.line == node.line);
+            if !already {
+                self.error_at(CompileError::VoidExpressionWhereNonVoidRequired, node)?;
+            }
+        }
         Ok(())
     }
 
@@ -1227,12 +1249,12 @@ impl<'a> SemanticChecker<'a> {
                 }
 
                 // Result type depends on operand types
-                if left_type == NwType::Float || right_type == NwType::Float {
+                if left_type == NwType::Vector || right_type == NwType::Vector {
+                    Ok(NwType::Vector)
+                } else if left_type == NwType::Float || right_type == NwType::Float {
                     Ok(NwType::Float)
                 } else if left_type == NwType::String && node.op == Operation::Add {
                     Ok(NwType::String)
-                } else if left_type == NwType::Vector {
-                    Ok(NwType::Vector)
                 } else {
                     Ok(NwType::Integer)
                 }
@@ -1273,18 +1295,20 @@ impl<'a> SemanticChecker<'a> {
                         node.op,
                         Operation::ConditionEqual | Operation::ConditionNotEqual
                     );
-                    // Equality: types must match exactly (or int<->float promotion)
-                    // Ordering: only int/float allowed
-                    let compatible = lt == rt
-                        || (matches!(lt, NwType::Integer | NwType::Float)
-                            && matches!(rt, NwType::Integer | NwType::Float));
-                    if !compatible {
-                        let err = if is_equality {
-                            CompileError::EqualityTestHasInvalidOperands
-                        } else {
-                            CompileError::ComparisonTestHasInvalidOperands
-                        };
-                        self.error_at(err, &node)?;
+                    if is_equality {
+                        // Equality: types must match (or int<->float promotion)
+                        let ok = lt == rt
+                            || (matches!(lt, NwType::Integer | NwType::Float)
+                                && matches!(rt, NwType::Integer | NwType::Float));
+                        if !ok {
+                            self.error_at(CompileError::EqualityTestHasInvalidOperands, &node)?;
+                        }
+                    } else {
+                        // Ordering (<, >, <=, >=): only int/float
+                        let numeric = |t| matches!(t, NwType::Integer | NwType::Float);
+                        if !numeric(lt) || !numeric(rt) {
+                            self.error_at(CompileError::ComparisonTestHasInvalidOperands, &node)?;
+                        }
                     }
                 }
                 Ok(NwType::Integer)
