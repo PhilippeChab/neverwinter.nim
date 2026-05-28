@@ -66,7 +66,7 @@ expectOk('local int = int', 'void main() { int x = 5; }');
 
 console.log('\n=== Function call errors ===');
 expectError('undefined function', 'void main() { undefinedFn(); }', 'undefined identifier');
-expectError('wrong arg type', 'void foo(int a) { }\nvoid main() { foo("string"); }', 'mismatched');
+expectError('wrong arg type', 'void foo(int a) { }\nvoid main() { foo("string"); }', 'does not match');
 expectError('too few args (no defaults)', 'void foo(int a, int b) { }\nvoid main() { foo(1); }', 'does not match');
 expectError('too many args', 'void foo(int a) { }\nvoid main() { foo(1, 2); }', 'does not match');
 
@@ -97,7 +97,9 @@ expectOk('add float + int promotes', 'void main() { float f = 1.0 + 2; }');
 console.log('\n=== Function decl errors ===');
 expectError('non-optional after optional', 'void foo(int a = 5, int b);', 'optional');
 expectError('duplicate impl', 'void foo() { }\nvoid foo() { }', 'duplicate');
-expectError('mismatched signatures', 'int foo();\nfloat foo() { return 1.0; }', 'differ');
+// C++ behavior: return type mismatch in decl-vs-impl is silently accepted.
+// Only parameter list is compared. Test parameter mismatch instead.
+expectError('mismatched signatures', 'void foo(int x);\nvoid foo(float x) { }', 'differ');
 
 expectOk('decl then impl matching', 'void foo();\nvoid foo() { }');
 expectOk('optional params', 'void foo(int a, int b = 10, string c = "x") { }');

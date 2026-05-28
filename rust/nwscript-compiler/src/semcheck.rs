@@ -385,21 +385,34 @@ impl<'a> SemanticChecker<'a> {
         self.check_pass(root)?;
 
         if self.require_entry_point {
-            let has_main = self.functions.iter().any(|f| {
-                f.name == "main"
-                    && f.return_type == NwType::Void
-                    && f.params.is_empty()
-                    && f.has_implementation
-            });
-            let has_intsc = self.functions.iter().any(|f| {
-                f.name == "StartingConditional"
-                    && f.return_type == NwType::Integer
-                    && f.params.is_empty()
-                    && f.has_implementation
-            });
-            if !has_main && !has_intsc {
-                let node = self.arena.get(root);
-                self.error_at(CompileError::NoFunctionMainInScript, node)?;
+            let main_fn = self.functions.iter().find(|f| f.name == "main" && f.has_implementation).cloned();
+            let intsc_fn = self.functions.iter().find(|f| f.name == "StartingConditional" && f.has_implementation).cloned();
+
+            match (&main_fn, &intsc_fn) {
+                (Some(m), _) => {
+                    // C++: main must be void and take no parameters
+                    let root_node = self.arena.get(root).clone();
+                    if m.return_type != NwType::Void {
+                        let _ = self.error_at(CompileError::FunctionMainMustHaveVoidReturnValue, &root_node);
+                    }
+                    if !m.params.is_empty() {
+                        let _ = self.error_at(CompileError::FunctionMainMustHaveNoParameters, &root_node);
+                    }
+                }
+                (None, Some(s)) => {
+                    // C++: StartingConditional must return int and take no parameters
+                    let root_node = self.arena.get(root).clone();
+                    if s.return_type != NwType::Integer {
+                        let _ = self.error_at(CompileError::FunctionIntscMustHaveVoidReturnValue, &root_node);
+                    }
+                    if !s.params.is_empty() {
+                        let _ = self.error_at(CompileError::FunctionIntscMustHaveNoParameters, &root_node);
+                    }
+                }
+                (None, None) => {
+                    let node = self.arena.get(root);
+                    self.error_at(CompileError::NoFunctionMainInScript, node)?;
+                }
             }
         }
 
@@ -536,8 +549,9 @@ impl<'a> SemanticChecker<'a> {
 
         let existing_idx = self.functions.iter().position(|f| f.name == name);
         if let Some(idx) = existing_idx {
-            let return_matches = self.functions[idx].return_type == new_return
-                && self.functions[idx].return_type_name == new_return_name;
+            // C++ only compares parameter list (not return type) for decl-vs-impl match
+            let return_matches = true;
+            let _ = new_return; let _ = new_return_name;
             let params_match = self.functions[idx].params.len() == params.len()
                 && self.functions[idx].params.iter().zip(params.iter())
                     .all(|(a, b)| a.nw_type == b.nw_type && a.type_name == b.type_name);
@@ -1191,8 +1205,9 @@ impl<'a> SemanticChecker<'a> {
                                 && arg_type != NwType::Void
                                 && expected != NwType::Void
                             {
+                                // C++ uses DeclarationDoesNotMatchParameters here
                                 self.error_at(
-                                    CompileError::MismatchedTypes,
+                                    CompileError::DeclarationDoesNotMatchParameters,
                                     &self.arena.get(arg.left).clone(),
                                 )?;
                             }

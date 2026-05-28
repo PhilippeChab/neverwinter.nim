@@ -650,8 +650,8 @@ mod tests {
             &r,
         );
         assert!(
-            result.diagnostics.iter().any(|d| d.error == CompileError::MismatchedTypes),
-            "Expected type mismatch from calling included function with wrong arg type: {:?}",
+            result.diagnostics.iter().any(|d| d.error == CompileError::DeclarationDoesNotMatchParameters),
+            "Expected param type mismatch from calling included function with wrong arg type: {:?}",
             result.diagnostics
         );
     }
