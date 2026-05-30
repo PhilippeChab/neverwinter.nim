@@ -244,7 +244,7 @@ void main() {
     if (x > 0) { x = 1; } else { x = -1; }
     while (x < 10) { x = x + 1; }
     do { x = x - 1; } while (x > 0);
-    for (int i = 0; i < 5; i++) { x = x + i; }
+    int i; for (i = 0; i < 5; i++) { x = x + i; }
     switch (x) {
         case 0: break;
         case 1: break;

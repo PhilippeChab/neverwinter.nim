@@ -13,3 +13,4 @@ pub mod optimize;
 pub mod ndb;
 pub mod astquery;
 pub mod wasm;
+pub mod xxh32;

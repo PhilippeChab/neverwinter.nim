@@ -123,7 +123,11 @@ fn expand_macros_in_line(line: &str, macros: &std::collections::HashMap<String, 
     if macros.is_empty() { return line.to_string(); }
 
     let bytes = line.as_bytes();
-    let mut out = String::with_capacity(line.len());
+    // Accumulate raw BYTES (not chars). `out.push(c as char)` would promote a UTF-8
+    // continuation byte like 0xC3 to U+00C3 and re-encode it as two bytes, corrupting
+    // multibyte string literals. Identifiers/macro names are ASCII; everything else
+    // (including bytes >= 0x80) passes through verbatim.
+    let mut out: Vec<u8> = Vec::with_capacity(line.len());
     let mut i = 0;
     let mut in_string = false;
     let mut in_line_comment = false;
@@ -133,12 +137,12 @@ fn expand_macros_in_line(line: &str, macros: &std::collections::HashMap<String, 
 
         // Track string/comment state to avoid expansion inside them
         if in_line_comment {
-            out.push(c as char);
+            out.push(c);
             i += 1;
             continue;
         }
         if in_string {
-            out.push(c as char);
+            out.push(c);
             if c == b'"' && (i == 0 || bytes[i-1] != b'\\') {
                 in_string = false;
             }
@@ -147,13 +151,13 @@ fn expand_macros_in_line(line: &str, macros: &std::collections::HashMap<String, 
         }
         if c == b'"' {
             in_string = true;
-            out.push(c as char);
+            out.push(c);
             i += 1;
             continue;
         }
         if c == b'/' && i + 1 < bytes.len() && bytes[i+1] == b'/' {
             in_line_comment = true;
-            out.push('/');
+            out.push(b'/');
             i += 1;
             continue;
         }
@@ -169,16 +173,18 @@ fn expand_macros_in_line(line: &str, macros: &std::collections::HashMap<String, 
             }
             let ident = &line[i..end];
             if let Some(val) = macros.get(ident) {
-                out.push_str(val);
+                out.extend_from_slice(val.as_bytes());
                 i = end;
                 continue;
             }
         }
 
-        out.push(c as char);
+        out.push(c);
         i += 1;
     }
-    out
+    // The byte buffer is valid UTF-8: the input line is UTF-8, identifier slices fall
+    // on char boundaries, and macro values are &str.
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 fn parse_engine_structure_defines(spec: &str) {
@@ -246,6 +252,12 @@ impl Compiler {
         // Resolve #includes
         let mut included_files: Vec<ParsedFile> = Vec::new();
         let mut included_set: HashSet<String> = HashSet::new();
+        // C++ registers the main file's own resref before resolving includes, so a
+        // `#include "self"` of the main file is silently deduped rather than re-parsed
+        // (which would otherwise trip recursion + duplicate-function errors).
+        // Include directives carry bare resrefs, so seed the extension-stripped name.
+        let main_resref = filename.strip_suffix(".nss").unwrap_or(filename);
+        included_set.insert(main_resref.to_string());
         let mut include_stack: Vec<String> = vec![filename.to_string()];
 
         self.resolve_includes(
@@ -401,8 +413,14 @@ impl Compiler {
         };
         diagnostics.extend(parser.diagnostics.clone());
 
+        let mut arena = std::mem::replace(&mut parser.arena, AstArena::new());
+        // C++: ConstantFoldNode runs before semantic analysis and codegen.
+        if root != NULL_NODE {
+            arena.fold_constants(root);
+        }
+
         ParsedFile {
-            arena: std::mem::replace(&mut parser.arena, AstArena::new()),
+            arena,
             root,
             file_names: parser.file_names,
             diagnostics,
@@ -420,22 +438,26 @@ impl Compiler {
         diagnostics: &mut Vec<Diagnostic>,
         depth: u32,
     ) {
-        if node_id == NULL_NODE {
-            return;
-        }
-
-        let node = arena.get(node_id);
-
-        if node.op == Operation::FunctionalUnit {
+        // Walk the flat right-linked FunctionalUnit chain ITERATIVELY. nwscript.nss has
+        // ~2000+ top-level declarations; per-declaration recursion overflows the stack
+        // (semcheck's register pass was already converted to an explicit walk for the
+        // same reason — codegen/include passes were missed).
+        let mut cur = node_id;
+        while cur != NULL_NODE {
+            let node = arena.get(cur);
+            if node.op != Operation::FunctionalUnit {
+                break;
+            }
             // Check if this FU contains an include
             if node.left != NULL_NODE {
                 let inner = arena.get(node.left);
                 if inner.op == Operation::FunctionalUnit && inner.int_data[0] == 1 {
                     // This is an include node
-                    if let Some(inc_name) = &inner.string_data {
+                    if let Some(inc_name) = inner.string_data.clone() {
+                        let inner = inner.clone();
                         self.process_include(
-                            inc_name,
-                            inner,
+                            &inc_name,
+                            &inner,
                             resolver,
                             included_files,
                             included_set,
@@ -446,20 +468,7 @@ impl Compiler {
                     }
                 }
             }
-
-            // Recurse into the chain
-            if node.right != NULL_NODE {
-                self.resolve_includes(
-                    node.right,
-                    arena,
-                    resolver,
-                    included_files,
-                    included_set,
-                    include_stack,
-                    diagnostics,
-                    depth,
-                );
-            }
+            cur = arena.get(cur).right;
         }
     }
 
@@ -474,30 +483,41 @@ impl Compiler {
         diagnostics: &mut Vec<Diagnostic>,
         depth: u32,
     ) {
+        // C++ OutputError (scriptcompcore.cpp:1502-1511) always renders the
+        // current file as "<name>.nss"; the include stack stores bare resref
+        // names. Match that so include-directive errors raised while parsing an
+        // included file get the ".nss" suffix (not "core_cmds(7)" but
+        // "core_cmds.nss(7)").
+        let current_file = |stack: &[String]| -> String {
+            let raw = stack.last().cloned().unwrap_or_default();
+            if raw.ends_with(".nss") { raw } else { format!("{}.nss", raw) }
+        };
+
         if depth >= self.options.max_include_depth {
             diagnostics.push(Diagnostic {
                 error: CompileError::IncludeTooManyLevels,
                 severity: Severity::Error,
-                file: include_stack.last().cloned().unwrap_or_default(),
+                file: current_file(include_stack),
                 line: node.line,
                 message: CompileError::IncludeTooManyLevels.message().to_string(),
             });
             return;
         }
 
-        // Match C++: filename comparison is case-insensitive (CompareNoCase)
-        let inc_lower = inc_name.to_lowercase();
-        if include_stack.iter().any(|s| s.to_lowercase() == inc_lower) {
+        // C++ compares include-stack entries with CExoString::operator== (strcmp), case-sensitive.
+        if include_stack.iter().any(|s| s == inc_name) {
             diagnostics.push(Diagnostic {
                 error: CompileError::IncludeRecursive,
                 severity: Severity::Error,
-                file: include_stack.last().cloned().unwrap_or_default(),
+                file: current_file(include_stack),
                 line: node.line,
                 message: format!("{}: {}", CompileError::IncludeRecursive.message(), inc_name),
             });
             return;
         }
 
+        // C++ duplicate-include check uses CExoString::CompareNoCase (case-insensitive).
+        let inc_lower = inc_name.to_lowercase();
         if included_set.iter().any(|s| s.to_lowercase() == inc_lower) {
             return;
         }
@@ -508,7 +528,7 @@ impl Compiler {
                 diagnostics.push(Diagnostic {
                     error: CompileError::FileNotFound,
                     severity: Severity::Error,
-                    file: include_stack.last().cloned().unwrap_or_default(),
+                    file: current_file(include_stack),
                     line: node.line,
                     message: format!("{}: {}", CompileError::FileNotFound.message(), inc_name),
                 });

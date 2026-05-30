@@ -11,7 +11,18 @@ pub struct Parser {
     pub file_names: Vec<String>,
     collect_all_errors: bool,
     require_entry_point: bool,
+    // Tracked while parsing inside a function definition; used to substitute
+    // __FUNCTION__ in the body (matches C++ scriptcompparsetree.cpp `m_sCurrentFunction`).
+    current_function: Option<String>,
+    // Recursion-depth guard for expression/statement nesting. Pathologically nested
+    // input (e.g. thousands of `(`) would otherwise overflow the recursive-descent
+    // stack and abort the whole WASM instance; this turns it into a clean error.
+    depth: u32,
 }
+
+/// Max expression/block nesting depth before the parser bails with a clean error
+/// instead of overflowing the stack. Real scripts nest only a handful of levels.
+const MAX_PARSE_DEPTH: u32 = 256;
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
@@ -23,6 +34,8 @@ impl Parser {
             file_names: Vec::new(),
             collect_all_errors: false,
             require_entry_point: true,
+            current_function: None,
+            depth: 0,
         }
     }
 
@@ -54,7 +67,22 @@ impl Parser {
         if self.peek_type() == tt {
             Ok(self.advance())
         } else {
-            Err(CompileError::UnexpectedCharacter)
+            // Map common expected-token failures to C++-equivalent specific error codes
+            let err = match tt {
+                TokenType::Semicolon => CompileError::NoSemicolonAfterExpression,
+                TokenType::LeftBracket => CompileError::NoLeftBracketOnExpression,
+                TokenType::RightBracket => CompileError::NoRightBracketOnExpression,
+                _ => CompileError::UnexpectedCharacter,
+            };
+            Err(err)
+        }
+    }
+
+    fn expect_err(&mut self, tt: TokenType, err: CompileError) -> Result<&Token, CompileError> {
+        if self.peek_type() == tt {
+            Ok(self.advance())
+        } else {
+            Err(err)
         }
     }
 
@@ -190,10 +218,18 @@ impl Parser {
     fn parse_include(&mut self) -> Result<NodeId, CompileError> {
         let tok = self.peek().clone();
         self.expect(TokenType::KeywordInclude)?;
-        let name_tok = self.advance().clone();
-        if name_tok.token_type != TokenType::String {
-            return Err(CompileError::FileNotFound);
+        // C++ (scriptcompparsetree.cpp:3796) fires the include rule ONLY when the next
+        // token is a string literal. For any other token the directive is silently
+        // ignored (no FileNotFound) and the token is NOT consumed — it falls through to
+        // normal declaration parsing. Match that rather than eating the token + erroring.
+        if self.peek().token_type != TokenType::String {
+            if self.at_end() {
+                // `#include` with nothing after: emit an empty no-op functional unit.
+                return Ok(self.make_node_at(Operation::FunctionalUnit, &tok));
+            }
+            return self.parse_functional_unit();
         }
+        let name_tok = self.advance().clone();
 
         let node = self.make_node_at(Operation::FunctionalUnit, &tok);
         let mut n = AstNode::new(Operation::FunctionalUnit);
@@ -265,7 +301,7 @@ impl Parser {
         }
 
         self.expect(TokenType::RightBrace)?;
-        self.expect(TokenType::Semicolon)?;
+        self.expect_err(TokenType::Semicolon, CompileError::NoSemicolonAfterStructure)?;
 
         self.arena.get_mut(struct_def).left = field_chain;
         self.arena.get_mut(struct_node).left = struct_def;
@@ -282,10 +318,21 @@ impl Parser {
             TokenType::KeywordObject => Ok((NwType::Object, None)),
             TokenType::KeywordVoid => Ok((NwType::Void, None)),
             TokenType::KeywordVector => Ok((NwType::Vector, None)),
-            TokenType::KeywordAction => Ok((NwType::Action, None)),
+            // C++ scriptcompparsetree.cpp:2197-2278 only treats `action` as a parameter
+            // type slot for engine action delegates (handled separately by the param
+            // list parser). It is not a valid user-declarable type for variables,
+            // return types, or struct fields.
+            TokenType::KeywordAction => Err(CompileError::InvalidDeclarationType),
             TokenType::KeywordStruct => {
                 let name = self.advance().clone();
-                Ok((NwType::Struct, Some(name.text.clone())))
+                // C++ scriptcompparsetree.cpp:2216-2224 collapses `struct vector` and the
+                // bare `vector` keyword into the same KEYWORD_STRUCT node — both spellings
+                // produce identical AST. Match by canonicalising to NwType::Vector.
+                if name.text == "vector" {
+                    Ok((NwType::Vector, None))
+                } else {
+                    Ok((NwType::Struct, Some(name.text.clone())))
+                }
             }
             tt if matches!(
                 tt,
@@ -319,26 +366,44 @@ impl Parser {
         if !matches!(type_info.0, NwType::Integer | NwType::Float | NwType::String) {
             self.error(CompileError::InvalidTypeForConstKeyword, &tok);
         }
-        let name_tok = self.advance().clone();
-        if name_tok.token_type != TokenType::Identifier {
-            return Err(CompileError::BadVariableName);
-        }
+        // C++ (scriptcompparsetree.cpp:3616-3690) accepts a comma-separated list of
+        // const declarators — `const int A=1, B=2;` — each requiring an initializer.
+        // Build a right-linked chain of FunctionalUnit/ConstDeclaration nodes (one per
+        // declarator); parse_program splices it into the top-level chain via find_rightmost.
+        let mut head = NULL_NODE;
+        loop {
+            let name_tok = self.advance().clone();
+            if name_tok.token_type != TokenType::Identifier {
+                return Err(CompileError::BadVariableName);
+            }
+            self.expect(TokenType::AssignmentEqual)?;
+            let value = self.parse_expression()?;
 
-        self.expect(TokenType::AssignmentEqual)?;
-        let value = self.parse_expression()?;
+            let fu = self.make_node_at(Operation::FunctionalUnit, &tok);
+            let const_decl = self.make_node_at(Operation::ConstDeclaration, &tok);
+            self.arena.get_mut(const_decl).string_data = Some(name_tok.text.clone());
+            self.arena.get_mut(const_decl).nw_type = type_info.0;
+            if let Some(tn) = &type_info.1 {
+                self.arena.get_mut(const_decl).type_name = Some(tn.clone());
+            }
+            self.arena.get_mut(const_decl).left = value;
+            self.arena.get_mut(fu).left = const_decl;
+
+            if head == NULL_NODE {
+                head = fu;
+            } else {
+                let last = self.find_rightmost(head);
+                self.arena.get_mut(last).right = fu;
+            }
+
+            if self.peek_type() != TokenType::Comma {
+                break;
+            }
+            self.advance();
+        }
         self.expect(TokenType::Semicolon)?;
 
-        let fu = self.make_node_at(Operation::FunctionalUnit, &tok);
-        let const_decl = self.make_node_at(Operation::ConstDeclaration, &tok);
-        self.arena.get_mut(const_decl).string_data = Some(name_tok.text.clone());
-        self.arena.get_mut(const_decl).nw_type = type_info.0;
-        if let Some(tn) = type_info.1 {
-            self.arena.get_mut(const_decl).type_name = Some(tn);
-        }
-        self.arena.get_mut(const_decl).left = value;
-        self.arena.get_mut(fu).left = const_decl;
-
-        Ok(fu)
+        Ok(head)
     }
 
     fn parse_function_or_global_var(&mut self) -> Result<NodeId, CompileError> {
@@ -372,8 +437,14 @@ impl Parser {
             self.arena.get_mut(func_id).type_name = Some(tn.clone());
         }
 
+        // C++ scriptcompparsetree.cpp:3486 sets m_sCurrentFunction before parsing
+        // the parameter list, so `__FUNCTION__` inside a default value expands
+        // to the function being declared.
+        let saved_func_for_params = self.current_function.take();
+        self.current_function = Some(name_tok.text.clone());
         let params = self.parse_parameter_list()?;
         self.expect(TokenType::RightBracket)?;
+        self.current_function = saved_func_for_params;
 
         if self.peek_type() == TokenType::Semicolon {
             self.advance();
@@ -385,7 +456,10 @@ impl Parser {
         }
 
         if self.peek_type() == TokenType::LeftBrace {
+            let saved_func = self.current_function.take();
+            self.current_function = Some(name_tok.text.clone());
             let body = self.parse_compound_statement()?;
+            self.current_function = saved_func;
             let func = self.make_node_at(Operation::Function, name_tok);
             self.arena.get_mut(func).left = func_id;
             self.arena.get_mut(func_id).left = params;
@@ -406,7 +480,15 @@ impl Parser {
         let mut had_optional = false;
 
         loop {
-            let type_info = self.parse_type_specifier()?;
+            // Parameter type slots accept `action` (for engine action delegates) in
+            // addition to the regular type specifiers — but only here, not for
+            // user-declared variables / return types.
+            let type_info = if self.peek_type() == TokenType::KeywordAction {
+                self.advance();
+                (NwType::Action, None)
+            } else {
+                self.parse_type_specifier()?
+            };
             let name_tok = self.advance().clone();
             if name_tok.token_type != TokenType::Identifier {
                 return Err(CompileError::MalformedParameterList);
@@ -450,6 +532,13 @@ impl Parser {
         type_info: (NwType, Option<String>),
         name_tok: &Token,
     ) -> Result<NodeId, CompileError> {
+        // C++ FUNCTIONAL_UNIT rule (scriptcompparsetree.cpp:3646-3648): a global
+        // declaration of type `void` is illegal -> INVALID_DECLARATION_TYPE (-567).
+        // (The local path already rejects it separately.)
+        if type_info.0 == NwType::Void {
+            return Err(CompileError::InvalidDeclarationType);
+        }
+
         let fu = self.make_node_at(Operation::FunctionalUnit, name_tok);
         let gv = self.make_node_at(Operation::GlobalVariables, name_tok);
         let decl = self.make_node_at(Operation::KeywordDeclaration, name_tok);
@@ -459,21 +548,42 @@ impl Parser {
             self.arena.get_mut(type_node).type_name = Some(tn.clone());
         }
 
-        let var = self.make_node_at(Operation::Variable, name_tok);
-        self.arena.get_mut(var).string_data = Some(name_tok.text.clone());
-
-        if self.peek_type() == TokenType::AssignmentEqual {
+        // C++ grammar (scriptcompparsetree.cpp:2057): a global declaration is a
+        // comma-separated list — `int a, b = 5, c;` is legal.
+        let mut vl_chain = NULL_NODE;
+        let mut first_tok = name_tok.clone();
+        loop {
+            let var = self.make_node_at(Operation::Variable, &first_tok);
+            self.arena.get_mut(var).string_data = Some(first_tok.text.clone());
+            if self.peek_type() == TokenType::AssignmentEqual {
+                self.advance();
+                let init = self.parse_expression()?;
+                self.arena.get_mut(var).left = init;
+            }
+            let vl = self.make_node(Operation::VariableList);
+            self.arena.get_mut(vl).left = var;
+            if vl_chain == NULL_NODE {
+                vl_chain = vl;
+            } else {
+                let last = self.find_rightmost(vl_chain);
+                self.arena.get_mut(last).right = vl;
+            }
+            if self.peek_type() != TokenType::Comma {
+                break;
+            }
             self.advance();
-            let init = self.parse_expression()?;
-            self.arena.get_mut(var).left = init;
+            // Next identifier becomes the new variable.
+            let nt = self.advance().clone();
+            if nt.token_type != TokenType::Identifier {
+                return Err(CompileError::BadVariableName);
+            }
+            first_tok = nt;
         }
 
         self.expect(TokenType::Semicolon)?;
 
-        let vl = self.make_node(Operation::VariableList);
-        self.arena.get_mut(vl).left = var;
         self.arena.get_mut(decl).left = type_node;
-        self.arena.get_mut(type_node).left = vl;
+        self.arena.get_mut(type_node).left = vl_chain;
         self.arena.get_mut(gv).left = decl;
         self.arena.get_mut(fu).left = gv;
 
@@ -563,6 +673,19 @@ impl Parser {
     }
 
     fn parse_statement(&mut self) -> Result<NodeId, CompileError> {
+        // Depth guard: deeply nested blocks / if-else chains would otherwise overflow
+        // the recursive-descent stack. Bail with a clean error past the limit.
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            self.depth -= 1;
+            return Err(CompileError::UnexpectedCharacter);
+        }
+        let r = self.parse_statement_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_statement_inner(&mut self) -> Result<NodeId, CompileError> {
         let tok = self.peek().clone();
         let stmt_node = self.make_node_at(Operation::Statement, &tok);
 
@@ -574,6 +697,13 @@ impl Parser {
             TokenType::KeywordFor => self.parse_for_statement()?,
             TokenType::KeywordSwitch => self.parse_switch_statement()?,
             TokenType::KeywordReturn => self.parse_return_statement()?,
+            TokenType::KeywordElse => {
+                // C++ rejects stray else with specific error.
+                // Emit, consume the `else`, then parse its body so we can keep going.
+                self.error(CompileError::ElseWithoutCorrespondingIf, &tok);
+                self.advance();
+                self.parse_statement()?
+            }
             TokenType::KeywordBreak => {
                 self.advance();
                 self.expect(TokenType::Semicolon)?;
@@ -609,6 +739,12 @@ impl Parser {
         let cond_expr = self.parse_expression()?;
         self.expect(TokenType::RightBracket)?;
 
+        // C++ rejects `if (cond);` (null statement after condition)
+        if self.peek_type() == TokenType::Semicolon {
+            let bad = self.peek().clone();
+            self.error(CompileError::IfConditionCannotBeFollowedByNullStatement, &bad);
+        }
+
         let body = self.parse_statement()?;
 
         let if_block = self.make_node_at(Operation::IfBlock, &tok);
@@ -620,6 +756,11 @@ impl Parser {
 
         if self.peek_type() == TokenType::KeywordElse {
             self.advance();
+            // C++ rejects `else;`
+            if self.peek_type() == TokenType::Semicolon {
+                let bad = self.peek().clone();
+                self.error(CompileError::ElseCannotBeFollowedByNullStatement, &bad);
+            }
             let else_body = self.parse_statement()?;
             self.arena.get_mut(if_choice).right = else_body;
         }
@@ -636,6 +777,12 @@ impl Parser {
 
         let cond = self.parse_expression()?;
         self.expect(TokenType::RightBracket)?;
+
+        // C++: while (cond); is invalid
+        if self.peek_type() == TokenType::Semicolon {
+            let bad = self.peek().clone();
+            self.error(CompileError::WhileConditionCannotBeFollowedByNullStatement, &bad);
+        }
 
         let body = self.parse_statement()?;
 
@@ -682,16 +829,22 @@ impl Parser {
         let init = if self.peek_type() == TokenType::Semicolon {
             self.advance();
             NULL_NODE
-        } else if self.peek_type().is_non_void_type_specifier() || self.peek_type() == TokenType::KeywordStruct {
-            self.parse_local_declaration()?
         } else {
+            // C++ grammar: for-loop init is an EXPRESSION, not a DECLARATION
+            // (scriptcompparsetree.cpp:2870). Declarations like `for (int i = 0;...)`
+            // are not allowed.
             let e = self.parse_expression()?;
             self.expect(TokenType::Semicolon)?;
             e
         };
 
         let cond = if self.peek_type() == TokenType::Semicolon {
-            NULL_NODE
+            // C++ synthesises a ConstantInteger(1) for an empty for-loop condition
+            // so the JZ in the loop body always has a real operand on the stack.
+            let n = self.make_node_at(Operation::ConstantInteger, &tok);
+            self.arena.get_mut(n).int_data[0] = 1;
+            self.arena.get_mut(n).nw_type = NwType::Integer;
+            n
         } else {
             self.parse_expression()?
         };
@@ -703,6 +856,12 @@ impl Parser {
             self.parse_expression()?
         };
         self.expect(TokenType::RightBracket)?;
+
+        // C++: for (;;); is invalid
+        if self.peek_type() == TokenType::Semicolon {
+            let bad = self.peek().clone();
+            self.error(CompileError::ForStatementCannotBeFollowedByNullStatement, &bad);
+        }
 
         let body = self.parse_statement()?;
 
@@ -759,6 +918,13 @@ impl Parser {
 
         let cond = self.parse_expression()?;
         self.expect(TokenType::RightBracket)?;
+
+        // C++: switch (x); is invalid
+        if self.peek_type() == TokenType::Semicolon {
+            let bad = self.peek().clone();
+            self.error(CompileError::SwitchConditionCannotBeFollowedByNullStatement, &bad);
+        }
+
         self.expect(TokenType::LeftBrace)?;
 
         let switch_block = self.make_node_at(Operation::SwitchBlock, &tok);
@@ -773,13 +939,13 @@ impl Parser {
             let case_node = if case_tok.token_type == TokenType::KeywordCase {
                 self.advance();
                 let val = self.parse_expression()?;
-                self.expect(TokenType::Colon)?;
+                self.expect_err(TokenType::Colon, CompileError::NoColonAfterCaseLabel)?;
                 let cn = self.make_node_at(Operation::Case, &case_tok);
                 self.arena.get_mut(cn).left = val;
                 cn
             } else if case_tok.token_type == TokenType::KeywordDefault {
                 self.advance();
-                self.expect(TokenType::Colon)?;
+                self.expect_err(TokenType::Colon, CompileError::NoColonAfterDefaultLabel)?;
                 self.make_node_at(Operation::Default, &case_tok)
             } else {
                 let stmt = self.parse_statement()?;
@@ -889,7 +1055,17 @@ impl Parser {
 
     // Expression parsing using precedence climbing
     pub fn parse_expression(&mut self) -> Result<NodeId, CompileError> {
-        self.parse_assignment_expr()
+        // Guard recursive-descent depth so pathologically nested input (e.g. thousands
+        // of nested parentheses) returns a clean error instead of overflowing the stack
+        // and aborting the WASM instance.
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            self.depth -= 1;
+            return Err(CompileError::UnexpectedCharacter);
+        }
+        let r = self.parse_assignment_expr();
+        self.depth -= 1;
+        r
     }
 
     fn parse_assignment_expr(&mut self) -> Result<NodeId, CompileError> {
@@ -897,7 +1073,12 @@ impl Parser {
 
         if self.peek_type().is_assignment_operator() {
             let op_tok = self.advance().clone();
-            let right = self.parse_assignment_expr()?;
+            // C++ grammar (scriptcompparsetree.cpp:1717-1731,:1788): the RHS of an
+            // assignment is a CONDITIONAL-expression, not another assignment. So
+            // `a = b = c` is NOT chained — after `a = b` the trailing `= c` is left
+            // for the statement terminator to reject. Parse the RHS at the ternary
+            // level to match.
+            let right = self.parse_ternary_expr()?;
             let assign = self.make_node_at(Operation::Assignment, &op_tok);
             self.arena.get_mut(assign).int_data[0] = op_tok.token_type as i32;
             self.arena.get_mut(assign).left = left;
@@ -909,11 +1090,28 @@ impl Parser {
     }
 
     fn parse_ternary_expr(&mut self) -> Result<NodeId, CompileError> {
+        // Depth guard: a deeply nested ternary chain (`a?b:a?b:...`) recurses here
+        // directly via the then/else branches without re-entering parse_expression,
+        // so it would evade that guard and overflow the stack (poisoning the WASM
+        // instance). Count it on the shared depth counter.
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            self.depth -= 1;
+            return Err(CompileError::UnexpectedCharacter);
+        }
+        let r = self.parse_ternary_expr_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_ternary_expr_inner(&mut self) -> Result<NodeId, CompileError> {
         let cond = self.parse_logical_or_expr()?;
 
         if self.peek_type() == TokenType::QuestionMark {
             let tok = self.advance().clone();
-            let then_expr = self.parse_expression()?;
+            // C++ grammar (scriptcompparsetree.cpp:1674): both branches are
+            // conditional-expressions, not assignment-expressions. Reject `a ? b = 1 : c`.
+            let then_expr = self.parse_ternary_expr()?;
             self.expect(TokenType::Colon)?;
             let else_expr = self.parse_ternary_expr()?;
 
@@ -1104,7 +1302,27 @@ impl Parser {
     }
 
     fn parse_unary_expr(&mut self) -> Result<NodeId, CompileError> {
+        // Depth guard: a long prefix-operator chain (`!!!…`, `---…`) recurses here
+        // without re-entering parse_expression, so it would evade that guard and
+        // overflow the stack. Count it on the same shared depth counter.
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            self.depth -= 1;
+            return Err(CompileError::UnexpectedCharacter);
+        }
+        let r = self.parse_unary_expr_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_unary_expr_inner(&mut self) -> Result<NodeId, CompileError> {
         match self.peek_type() {
+            TokenType::Plus => {
+                // C++ UNARY_EXPRESSION rule 6 (scriptcompparsetree.cpp:1071-1076):
+                // a leading unary `+` is a no-op that passes its operand through.
+                self.advance();
+                self.parse_unary_expr()
+            }
             TokenType::Minus => {
                 let tok = self.advance().clone();
                 let operand = self.parse_unary_expr()?;
@@ -1210,7 +1428,8 @@ impl Parser {
                 self.advance();
                 let node = self.make_node_at(Operation::ConstantObject, &tok);
                 self.arena.get_mut(node).nw_type = NwType::Object;
-                self.arena.get_mut(node).int_data[0] = if tok.token_type == TokenType::KeywordObjectSelf { 0 } else { 0x7f000000u32 as i32 };
+                // C++: OBJECT_SELF = 0, OBJECT_INVALID = 1 (per scriptcompparsetree.cpp)
+                self.arena.get_mut(node).int_data[0] = if tok.token_type == TokenType::KeywordObjectSelf { 0 } else { 1 };
                 Ok(node)
             }
 
@@ -1251,30 +1470,35 @@ impl Parser {
                         Ok(node)
                     }
                     TokenType::KeywordDashDashFile => {
+                        // C++: resolves to the currently-lexed include file, not the entry script
                         let node = self.make_node_at(Operation::ConstantString, &tok);
                         self.arena.get_mut(node).nw_type = NwType::String;
-                        let fname = self.file_names.first().cloned().unwrap_or_default();
+                        let fname = self.file_names.get(tok.file_id as usize)
+                            .cloned()
+                            .unwrap_or_else(|| self.file_names.first().cloned().unwrap_or_default());
+                        // C++ appends ".nss" if not already present
+                        let fname = if fname.ends_with(".nss") { fname } else { format!("{}.nss", fname) };
                         self.arena.get_mut(node).string_data = Some(fname);
                         Ok(node)
                     }
                     TokenType::KeywordDashDashFunction => {
                         let node = self.make_node_at(Operation::ConstantString, &tok);
                         self.arena.get_mut(node).nw_type = NwType::String;
-                        self.arena.get_mut(node).string_data = Some(String::new());
-                        self.arena.get_mut(node).int_data[1] = 1; // marker: fill in during codegen
+                        let name = self.current_function.clone().unwrap_or_default();
+                        self.arena.get_mut(node).string_data = Some(name);
                         Ok(node)
                     }
                     TokenType::KeywordDashDashDate => {
                         let node = self.make_node_at(Operation::ConstantString, &tok);
                         self.arena.get_mut(node).nw_type = NwType::String;
-                        self.arena.get_mut(node).string_data = Some(String::new()); // filled at compile time
+                        self.arena.get_mut(node).string_data = Some(format_now_date());
                         Ok(node)
                     }
                     _ => {
                         // __TIME__
                         let node = self.make_node_at(Operation::ConstantString, &tok);
                         self.arena.get_mut(node).nw_type = NwType::String;
-                        self.arena.get_mut(node).string_data = Some(String::new());
+                        self.arena.get_mut(node).string_data = Some(format_now_time());
                         Ok(node)
                     }
                 }
@@ -1287,48 +1511,81 @@ impl Parser {
                 Ok(expr)
             }
 
-            TokenType::KeywordVector => {
-                self.advance();
-                self.expect(TokenType::LeftBracket)?;
-                let x = self.parse_expression()?;
-                self.expect(TokenType::Comma)?;
-                let y = self.parse_expression()?;
-                self.expect(TokenType::Comma)?;
-                let z = self.parse_expression()?;
-                self.expect(TokenType::RightBracket)?;
-                let node = self.make_node_at(Operation::ConstantVector, &tok);
-                self.arena.get_mut(node).nw_type = NwType::Vector;
-                // store as linked list: x -> y -> z
-                let arg1 = self.make_node(Operation::ActionArgList);
-                let arg2 = self.make_node(Operation::ActionArgList);
-                self.arena.get_mut(arg1).left = x;
-                self.arena.get_mut(arg1).right = arg2;
-                self.arena.get_mut(arg2).left = y;
-                let arg3 = self.make_node(Operation::ActionArgList);
-                self.arena.get_mut(arg2).right = arg3;
-                self.arena.get_mut(arg3).left = z;
-                self.arena.get_mut(node).left = arg1;
-                Ok(node)
-            }
+            // C++ does NOT accept `vector(x, y, z)` as a constructor; the `vector`
+            // keyword is type-context only. Drop the special case so it falls through
+            // to BadStartOfStatement, matching C++.
 
             TokenType::LeftSquareBracket => {
                 self.advance();
-                let x = self.parse_expression()?;
-                self.expect(TokenType::Comma)?;
-                let y = self.parse_expression()?;
-                self.expect(TokenType::Comma)?;
-                let z = self.parse_expression()?;
+                // C++: accept 0–3 float-literal components; missing default to 0.0;
+                // anything other than TOKEN_FLOAT inside is ParsingConstantVector.
+                let mut comps: [NodeId; 3] = [NULL_NODE, NULL_NODE, NULL_NODE];
+                let mut count = 0usize;
+                while self.peek_type() != TokenType::RightSquareBracket && !self.at_end() {
+                    if count >= 3 {
+                        let bad = self.peek().clone();
+                        self.error(CompileError::ParsingConstantVector, &bad);
+                        break;
+                    }
+                    // C++ scriptcompparsetree.cpp:662-731 only accepts a bare
+                    // TOKEN_FLOAT here — no leading sign. `[-1.0, 0, 0]` is rejected.
+                    let negate = false;
+                    let num_tok = self.peek().clone();
+                    if num_tok.token_type != TokenType::Float {
+                        self.error(CompileError::ParsingConstantVector, &num_tok);
+                        // try to recover by consuming through ] or ,
+                        while !self.at_end()
+                            && self.peek_type() != TokenType::Comma
+                            && self.peek_type() != TokenType::RightSquareBracket
+                        {
+                            self.advance();
+                        }
+                    } else {
+                        self.advance();
+                        let lit = self.make_node_at(Operation::ConstantFloat, &num_tok);
+                        let mut v: f32 = num_tok.text.trim_end_matches(|c| c == 'f' || c == 'F').parse().unwrap_or(0.0);
+                        if negate { v = -v; }
+                        self.arena.get_mut(lit).float_data = v;
+                        self.arena.get_mut(lit).nw_type = NwType::Float;
+                        comps[count] = lit;
+                        count += 1;
+                    }
+                    if self.peek_type() == TokenType::Comma {
+                        self.advance();
+                        // C++ grammar (scriptcompparsetree.cpp:690-731) requires a
+                        // TOKEN_FLOAT after each comma; a trailing `]` here is
+                        // ERROR_PARSING_CONSTANT_VECTOR (-631), not a silent default.
+                        if self.peek_type() == TokenType::RightSquareBracket {
+                            let bad = self.peek().clone();
+                            self.error(CompileError::ParsingConstantVector, &bad);
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
                 self.expect(TokenType::RightSquareBracket)?;
+
+                // Fill missing components with 0.0
+                for slot in comps.iter_mut() {
+                    if *slot == NULL_NODE {
+                        let z = self.make_node_at(Operation::ConstantFloat, &tok);
+                        self.arena.get_mut(z).float_data = 0.0;
+                        self.arena.get_mut(z).nw_type = NwType::Float;
+                        *slot = z;
+                    }
+                }
+
                 let node = self.make_node_at(Operation::ConstantVector, &tok);
                 self.arena.get_mut(node).nw_type = NwType::Vector;
                 let arg1 = self.make_node(Operation::ActionArgList);
                 let arg2 = self.make_node(Operation::ActionArgList);
                 let arg3 = self.make_node(Operation::ActionArgList);
-                self.arena.get_mut(arg1).left = x;
+                self.arena.get_mut(arg1).left = comps[0];
                 self.arena.get_mut(arg1).right = arg2;
-                self.arena.get_mut(arg2).left = y;
+                self.arena.get_mut(arg2).left = comps[1];
                 self.arena.get_mut(arg2).right = arg3;
-                self.arena.get_mut(arg3).left = z;
+                self.arena.get_mut(arg3).left = comps[2];
                 self.arena.get_mut(node).left = arg1;
                 Ok(node)
             }
@@ -1343,7 +1600,10 @@ impl Parser {
 
                     let args = self.parse_argument_list()?;
 
-                    self.expect(TokenType::RightBracket)?;
+                    self.expect_err(
+                        TokenType::RightBracket,
+                        CompileError::NoRightBracketOnArgList,
+                    )?;
 
                     self.arena.get_mut(action).left = action_id;
                     self.arena.get_mut(action_id).right = args;
@@ -1390,21 +1650,70 @@ impl Parser {
     }
 }
 
+/// C++ NWScript emits `__DATE__` as "YYYY-MM-DD" via strftime. We do the same
+/// using the system clock at parse time. Avoids a chrono dependency.
+fn format_now_date() -> String {
+    let (y, m, d, _, _, _) = system_time_components();
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+fn format_now_time() -> String {
+    let (_, _, _, h, mi, s) = system_time_components();
+    format!("{:02}:{:02}:{:02}", h, mi, s)
+}
+
+fn system_time_components() -> (i32, u32, u32, u32, u32, u32) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // Civil-from-days algorithm (Howard Hinnant); valid for all years.
+    let days = secs.div_euclid(86_400);
+    let time_of_day = secs.rem_euclid(86_400) as u32;
+    let hour = time_of_day / 3600;
+    let minute = (time_of_day / 60) % 60;
+    let second = time_of_day % 60;
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m, d, hour, minute, second)
+}
+
 fn parse_integer(text: &str, tt: TokenType) -> i32 {
+    // C++ scriptcompparsetree.cpp:463-536 accumulates each digit into an int32_t with
+    // wrapping multiply-accumulate, so a literal beyond 2^32 keeps its low 32 bits
+    // (0xFFFFFFFFFFFFFFFF -> -1, 99999999999999999999 -> 1661992959). A plain i64
+    // parse would `Err` on such literals and silently fall back to 0; accumulating
+    // matches C++ and is identical to `as i32` truncation for any in-range value.
+    fn accumulate(digits: &str, base: u32) -> i32 {
+        let mut acc: i32 = 0;
+        for c in digits.chars() {
+            if let Some(d) = c.to_digit(base) {
+                acc = acc.wrapping_mul(base as i32).wrapping_add(d as i32);
+            }
+        }
+        acc
+    }
     match tt {
         TokenType::HexInteger => {
-            let hex = text.trim_start_matches("0x").trim_start_matches("0X");
-            i64::from_str_radix(hex, 16).unwrap_or(0) as i32
+            accumulate(text.trim_start_matches("0x").trim_start_matches("0X"), 16)
         }
         TokenType::BinaryInteger => {
-            let bin = text.trim_start_matches("0b").trim_start_matches("0B");
-            i64::from_str_radix(bin, 2).unwrap_or(0) as i32
+            accumulate(text.trim_start_matches("0b").trim_start_matches("0B"), 2)
         }
         TokenType::OctalInteger => {
-            let oct = text.trim_start_matches("0o").trim_start_matches("0O");
-            i64::from_str_radix(oct, 8).unwrap_or(0) as i32
+            accumulate(text.trim_start_matches("0o").trim_start_matches("0O"), 8)
         }
-        _ => text.parse::<i64>().unwrap_or(0) as i32,
+        _ => accumulate(text, 10),
     }
 }
 

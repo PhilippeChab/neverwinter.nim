@@ -82,7 +82,7 @@ expectError('duplicate default', 'void main() { switch (1) { default: break; def
 expectError('non-const case', 'void main() { int v = 5; switch (1) { case v + 1: break; } }', 'case parameter');
 expectError('not all paths return', 'int foo() { }', 'control paths');
 
-expectOk('break in for', 'void main() { for (int i=0; i<10; i++) { break; } }');
+expectOk('break in for', 'void main() { int i; for (i=0; i<10; i++) { break; } }');
 expectOk('break in switch', 'void main() { switch (1) { case 1: break; } }');
 expectOk('all paths return', 'int foo(int x) { if (x>0) return 1; else return 0; }');
 
@@ -93,6 +93,15 @@ expectError('subtract strings', 'void main() { string s = "a" - "b"; }', 'mismat
 expectOk('add int + int', 'void main() { int x = 1 + 2; }');
 expectOk('concat string + string', 'void main() { string s = "a" + "b"; }');
 expectOk('add float + int promotes', 'void main() { float f = 1.0 + 2; }');
+
+// Compound assignment validates the inner operator's operand rules (C++ -592).
+expectError('vector += float', 'void main() { vector v; v += 1.0; }', 'arithmetic');
+expectError('float %= float', 'void main() { float a; a %= 2.0; }', 'arithmetic');
+expectError('float %= int', 'void main() { float f; f %= 2; }', 'arithmetic');
+expectOk('int += int compound', 'void main() { int a; a += 2; }');
+expectOk('float += int compound', 'void main() { float a; a += 2; }');
+expectOk('vector *= float compound', 'void main() { vector v; v *= 2.0; }');
+expectOk('string += string compound', 'void main() { string a; a += "x"; }');
 
 console.log('\n=== Function decl errors ===');
 expectError('non-optional after optional', 'void foo(int a = 5, int b);', 'optional');
@@ -105,16 +114,35 @@ expectOk('decl then impl matching', 'void foo();\nvoid foo() { }');
 expectOk('optional params', 'void foo(int a, int b = 10, string c = "x") { }');
 
 console.log('\n=== Syntax errors ===');
-expectError('missing semicolon', 'int x = 5\nint y = 6;', 'unexpected');
+expectError('missing semicolon', 'int x = 5\nint y = 6;', "expected ';'");
 expectError('incomplete declaration', 'int x = ;', null);
 expectError('unclosed brace', 'void main() {', null);
 expectError('unclosed paren', 'void main() { int x = (1 + 2; }', null);
 
+console.log('\n=== Declaration type errors ===');
+// C++ rejects a void-typed global declaration with -567 (local path already -570).
+expectError('global void var', 'void v;\nvoid main() {}', 'declaration type');
+expectError('global void var init', 'void v = 0;\nvoid main() {}', 'declaration type');
+// Unary plus is a no-op prefix in C++ (UNARY_EXPRESSION rule 6); accept it.
+expectOk('unary plus literal', 'void main() { int x = +5; }');
+expectOk('unary plus on var', 'void main() { int a = 1; int x = +a; }');
+
 console.log('\n=== Struct errors ===');
 expectError('undefined struct field', 'struct P { int a; };\nvoid main() { struct P p; int x = p.b; }', 'undefined field');
+// C++ -620: returning a differently-named struct from a struct-returning function.
+expectError('struct return name mismatch', 'struct A{int x;}; struct B{int y;}; struct A make(){ struct B b; return b; } void main(){ make(); }', 'return type');
+expectOk('struct return name match', 'struct A{int x;}; struct A make(){ struct A a; return a; } void main(){ make(); }');
 
 expectOk('struct field access', 'struct P { int a; };\nvoid main() { struct P p; int x = p.a; }');
 expectOk('nested struct', 'struct A { int x; };\nstruct B { struct A a; };\nvoid main() { struct B b; int x = b.a.x; }');
+
+console.log('\n=== Vector literal errors ===');
+// C++ requires a float after each comma; a trailing comma is -631.
+expectError('vector trailing comma', 'void main() { vector v = [1.0,]; }', 'constant vector');
+expectError('vector trailing comma 2', 'void main() { vector v = [1.0,2.0,]; }', 'constant vector');
+expectError('vector leading comma', 'void main() { vector v = [,2.0]; }', 'constant vector');
+expectOk('vector 3 components', 'void main() { vector v = [1.0,2.0,3.0]; }');
+expectOk('vector 1 component', 'void main() { vector v = [1.0]; }');
 
 console.log('\n=== Include errors ===');
 expectError('include not found', '#include "nonexistent"\nvoid main() { }', 'file not found');

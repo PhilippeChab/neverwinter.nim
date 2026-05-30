@@ -26,6 +26,10 @@ struct LocalVar {
     stack_offset: i32,
     scope_level: u32,
     size: i32,
+    // True for variables in the global area. For globals, `stack_offset` is the
+    // byte position within the global area (0 = first global). Address as
+    // (stack_offset - global_var_size) relative to BP.
+    is_global: bool,
 }
 
 pub struct CodeGenerator<'a> {
@@ -42,8 +46,13 @@ pub struct CodeGenerator<'a> {
     collect_all_errors: bool,
     func_sigs: Vec<FunctionSig>,
     struct_defs: Vec<StructDef>,
+    // Compile-time values of `const` declarations (main file + includes), imported
+    // from the semantic checker. C++ folds a const reference to its literal value at
+    // its use site (consts allocate no runtime storage); we emit the literal here.
+    const_values: std::collections::HashMap<String, crate::semcheck::DefaultValue>,
     current_func_name: Option<String>,
     current_return_type: NwType,
+    current_return_type_name: Option<String>,
     current_return_slot_offset: i32,
     optimization_level: u32,
     reachable_functions: std::collections::HashSet<String>,
@@ -56,8 +65,18 @@ pub struct CodeGenerator<'a> {
     loop_start_stack: Vec<usize>,
     break_fixup_stack: Vec<Vec<usize>>,
     continue_fixup_stack: Vec<Vec<usize>>,
+    // Stack depth and code-offset at the entry of each enclosing loop/switch.
+    // Code-offset is used to pick the innermost scope unambiguously (C++ compares
+    // m_nSwitchIdentifier vs m_nLoopIdentifier, both being code offsets).
+    loop_entry_depth_stack: Vec<i32>,
+    loop_entry_offset_stack: Vec<usize>,
+    switch_entry_depth_stack: Vec<i32>,
+    switch_entry_offset_stack: Vec<usize>,
     has_globals: bool,
     global_var_size: i32,
+    // Recursion-depth guard for expression codegen (defense-in-depth: semcheck
+    // already caps at 2000, but a deep operator chain shouldn't crash codegen either).
+    expr_depth: u32,
 }
 
 impl<'a> CodeGenerator<'a> {
@@ -76,8 +95,10 @@ impl<'a> CodeGenerator<'a> {
             collect_all_errors: false,
             func_sigs: Vec::new(),
             struct_defs: Vec::new(),
+            const_values: std::collections::HashMap::new(),
             current_func_name: None,
             current_return_type: NwType::Void,
+            current_return_type_name: None,
             current_return_slot_offset: 0,
             optimization_level: 0,
             reachable_functions: std::collections::HashSet::new(),
@@ -89,8 +110,13 @@ impl<'a> CodeGenerator<'a> {
             loop_start_stack: Vec::new(),
             break_fixup_stack: Vec::new(),
             continue_fixup_stack: Vec::new(),
+            loop_entry_depth_stack: Vec::new(),
+            loop_entry_offset_stack: Vec::new(),
+            switch_entry_depth_stack: Vec::new(),
+            switch_entry_offset_stack: Vec::new(),
             has_globals: false,
             global_var_size: 0,
+            expr_depth: 0,
         }
     }
 
@@ -105,6 +131,35 @@ impl<'a> CodeGenerator<'a> {
     pub fn load_symbols(&mut self, checker: &SemanticChecker) {
         self.func_sigs = checker.functions.clone();
         self.struct_defs = checker.structs.clone();
+
+        // Import const values so a const reference can be folded to its literal at the
+        // use site (C++ behavior — consts allocate no storage). The checker has already
+        // resolved every const (main file + includes), including const-from-const.
+        self.const_values = checker.collect_const_values();
+
+        // C++ scriptcompcore.cpp:925-950 seeds the struct table with the "vector"
+        // pseudo-struct, then user-defined structs follow. The NDB writer emits
+        // one `s` / `sf` block per entry.
+        self.ndb_structs.clear();
+        self.ndb_structs.push(crate::ndb::NdbStructDef {
+            name: "vector".to_string(),
+            fields: vec![
+                ("x".to_string(), crate::types::NwType::Float, String::new()),
+                ("y".to_string(), crate::types::NwType::Float, String::new()),
+                ("z".to_string(), crate::types::NwType::Float, String::new()),
+            ],
+        });
+        for s in &self.struct_defs {
+            if s.name == "vector" { continue; }
+            self.ndb_structs.push(crate::ndb::NdbStructDef {
+                name: s.name.clone(),
+                fields: s.fields.iter().map(|f| (
+                    f.name.clone(),
+                    f.nw_type,
+                    f.type_name.clone().unwrap_or_default(),
+                )).collect(),
+            });
+        }
     }
 
     // ========== Low-level emission ==========
@@ -177,6 +232,11 @@ impl<'a> CodeGenerator<'a> {
             .map(|l| (l.stack_offset, l.size, l.nw_type, l.type_name.clone()))
     }
 
+    fn find_var(&self, name: &str) -> Option<(i32, i32, NwType, Option<String>, bool)> {
+        self.locals.iter().rev().find(|l| l.name == name)
+            .map(|l| (l.stack_offset, l.size, l.nw_type, l.type_name.clone(), l.is_global))
+    }
+
     fn find_engine_func(&self, name: &str) -> Option<(u16, &FunctionSig)> {
         self.func_sigs.iter().enumerate()
             .find(|(_, f)| f.name == name && f.is_engine_action)
@@ -191,11 +251,103 @@ impl<'a> CodeGenerator<'a> {
         self.struct_defs.iter().find(|s| s.name == name).map(|s| s.byte_size).unwrap_or(0)
     }
 
+    /// Resolve the struct type-name of an expression node (the parser does not populate
+    /// `type_name` on Variable/Action nodes). Mirrors gen_struct_field_read_typed.
+    fn resolve_expr_struct_name(&self, node_id: NodeId) -> Option<String> {
+        if node_id == NULL_NODE { return None; }
+        let n = self.arena.get(node_id).clone();
+        match n.op {
+            Operation::Variable => {
+                let name = n.string_data.as_deref()?;
+                self.find_var(name).and_then(|(_, _, _, tn, _)| tn)
+            }
+            Operation::Action => {
+                if n.left == NULL_NODE { return None; }
+                let aid = self.arena.get(n.left);
+                let fname = aid.string_data.as_deref()?;
+                self.func_sigs.iter().find(|f| f.name == fname)
+                    .and_then(|f| f.return_type_name.clone())
+            }
+            Operation::StructurePart => {
+                // The field's struct type, resolved from its parent struct.
+                let field = n.string_data.as_deref()?;
+                let parent = self.resolve_expr_struct_name(n.left)?;
+                self.struct_defs.iter().find(|s| s.name == parent)
+                    .and_then(|s| s.fields.iter().find(|f| f.name == field))
+                    .and_then(|f| f.type_name.clone())
+            }
+            Operation::CondBlock => {
+                // Ternary: resolve the then-branch (CondBlock.right is the CondChoice
+                // whose .left is the then-branch). Matches the semcheck resolver so a
+                // struct ternary used as a `==` operand emits the correct size operand.
+                if n.right == NULL_NODE { return None; }
+                let choice_left = self.arena.get(n.right).left;
+                self.resolve_expr_struct_name(choice_left)
+            }
+            _ => n.type_name.clone(),
+        }
+    }
+
+    /// Walks a nested `s.a.b.c` StructurePart chain down to the root Variable and
+    /// returns (combined_offset, field_size, is_global). Used by inc/dec and could
+    /// be reused for struct-field assignment.
+    fn resolve_struct_field_lvalue(&self, node_id: NodeId) -> Option<(i32, i32, bool)> {
+        let mut path: Vec<String> = Vec::new();
+        let mut cur = node_id;
+        loop {
+            let n = self.arena.get(cur).clone();
+            match n.op {
+                Operation::StructurePart => {
+                    path.push(n.string_data.as_deref().unwrap_or("").to_string());
+                    if n.left == NULL_NODE { return None; }
+                    cur = n.left;
+                }
+                Operation::Variable => break,
+                _ => return None,
+            }
+        }
+        let root = self.arena.get(cur).clone();
+        let var_name = root.string_data.as_deref()?;
+        let (so, _struct_sz, _, type_name, is_global) = self.find_var(var_name)?;
+        let mut cur_type_name = type_name;
+        let mut cur_offset = 0i32;
+        let mut cur_size = 4i32;
+        for field in path.iter().rev() {
+            if let Some(tn) = &cur_type_name {
+                let (off, sz, ftype) = self.struct_field_offset(tn, field)?;
+                cur_offset += off;
+                cur_size = sz;
+                cur_type_name = if ftype == NwType::Struct {
+                    self.struct_defs.iter()
+                        .find(|s| s.name == *tn)
+                        .and_then(|s| s.fields.iter().find(|f| f.name == *field))
+                        .and_then(|f| f.type_name.clone())
+                } else {
+                    None
+                };
+            } else {
+                let (off, sz) = match field.as_str() {
+                    "x" => (0, 4),
+                    "y" => (4, 4),
+                    "z" => (8, 4),
+                    _ => return None,
+                };
+                cur_offset += off;
+                cur_size = sz;
+            }
+        }
+        Some((so + cur_offset, cur_size, is_global))
+    }
+
     fn struct_field_offset(&self, struct_name: &str, field_name: &str) -> Option<(i32, i32, NwType)> {
         if let Some(sd) = self.struct_defs.iter().find(|s| s.name == struct_name) {
             for f in &sd.fields {
                 if f.name == field_name {
-                    return Some((f.offset, f.nw_type.size_bytes(), f.nw_type));
+                    // C++ scriptcompfinalcode.cpp:4830-4849 uses the FIELD'S type-name
+                    // to compute size — for a struct-typed field it's the inner struct's
+                    // full byte size, not the scalar size (which is 0 for Struct).
+                    let sz = self.type_size(f.nw_type, &f.type_name);
+                    return Some((f.offset, sz, f.nw_type));
                 }
             }
         }
@@ -252,15 +404,25 @@ impl<'a> CodeGenerator<'a> {
     }
 
     fn has_global_vars(&self, node_id: NodeId) -> bool {
-        if node_id == NULL_NODE { return false; }
-        let node = self.arena.get(node_id);
-        match node.op {
-            Operation::FunctionalUnit => {
-                self.has_global_vars(node.left) || self.has_global_vars(node.right)
+        // Iterate the flat FunctionalUnit chain (per-declaration recursion overflows
+        // the stack on large includes like nwscript.nss).
+        let mut cur = node_id;
+        while cur != NULL_NODE {
+            let node = self.arena.get(cur);
+            match node.op {
+                Operation::FunctionalUnit => {
+                    if node.left != NULL_NODE
+                        && self.arena.get(node.left).op == Operation::GlobalVariables
+                    {
+                        return true;
+                    }
+                    cur = node.right;
+                }
+                Operation::GlobalVariables => return true,
+                _ => return false,
             }
-            Operation::GlobalVariables => true,
-            _ => false,
         }
+        false
     }
 
     fn entry_point_name(&self) -> &str {
@@ -274,19 +436,44 @@ impl<'a> CodeGenerator<'a> {
     }
 
     fn emit_loader(&mut self, _root: NodeId) -> Result<(), CompileError> {
+        // C++: loader is `JSR (#globals|entry); RET`.
+        // SAVE/RESTORE_BASE_POINTER live inside #globals.
+        // For StartingConditional WITHOUT globals, C++ scriptcompfinalcode.cpp:572-600
+        // also reserves a return-value slot before the JSR so the conditional's
+        // bytecode has somewhere to write its result.
+        let loader_start = self.pos();
         let entry = self.entry_point_name().to_string();
+        let is_conditional = entry == "StartingConditional";
+        // C++ scriptcompfinalcode.cpp:571-599 (InstallLoader): for an int-returning
+        // conditional the loader emits RUNSTACK_ADD INTEGER before the JSR
+        // UNCONDITIONALLY. has_globals only picks the JSR target (#globals vs entry),
+        // not whether the retval slot is reserved. The #globals writeback offset
+        // `-(global_var_size + 12)` assumes this loader slot exists.
+        if is_conditional {
+            self.emit_op(Opcode::RunstackAdd, NwType::Integer.auxcode());
+            self.stack_depth += 1;
+        }
         if self.has_globals {
-            self.emit_op(Opcode::SaveBasePointer, 0);
             self.emit_jsr_label("#globals");
-            self.emit_op(Opcode::RestoreBasePointer, 0);
         } else {
             self.emit_jsr_label(&entry);
         }
         self.emit_op(Opcode::Ret, 0);
+        // C++ registers #loader as a real identifier and emits an NDB function entry
+        // for it (scriptcompfinalcode.cpp:556-648, NDB loop :6938).
+        self.ndb_functions.push(crate::ndb::NdbFunctionEntry {
+            name: "#loader".to_string(),
+            return_type: NwType::Void,
+            return_struct_name: String::new(),
+            code_start: loader_start as u32,
+            code_end: self.pos() as u32,
+            params: Vec::new(),
+        });
         Ok(())
     }
 
     fn emit_globals_func(&mut self, root: NodeId) -> Result<(), CompileError> {
+        let globals_start = self.pos();
         self.add_label("#globals");
         self.stack_depth = 0;
         self.global_var_size = 0;
@@ -294,10 +481,31 @@ impl<'a> CodeGenerator<'a> {
         // Walk the tree to emit global variable initializers
         self.emit_global_var_inits(root)?;
 
-        // After globals are initialized, call entry point
+        // After globals are initialized, call entry point.
         let entry = self.entry_point_name().to_string();
+        let is_conditional = entry == "StartingConditional";
+
+        // C++ ordering for conditional scripts:
+        //   SAVE_BASE_POINTER
+        //   RUNSTACK_ADD INTEGER         ; retval slot
+        //   JSR entry
+        //   ASSIGNMENT -(globals+12), 4  ; writeback retval into globals area
+        //   MODIFY_STACK_POINTER -4
+        //   RESTORE_BASE_POINTER
         self.emit_op(Opcode::SaveBasePointer, 0);
+        if is_conditional {
+            self.emit_op(Opcode::RunstackAdd, NwType::Integer.auxcode());
+            self.stack_depth += 1;
+        }
         self.emit_jsr_label(&entry);
+        if is_conditional {
+            // Writeback offset = -(global_var_size + 12) per C++
+            self.emit_op(Opcode::Assignment, 0x01);
+            self.emit_i32(-(self.global_var_size + 12));
+            self.emit_u16(4);
+            self.emit_modify_sp(-4);
+            self.stack_depth -= 1;
+        }
         self.emit_op(Opcode::RestoreBasePointer, 0);
 
         // Clean up globals from stack
@@ -306,6 +514,16 @@ impl<'a> CodeGenerator<'a> {
         }
 
         self.emit_op(Opcode::Ret, 0);
+
+        // C++ emits an NDB function entry for #globals (scriptcompfinalcode.cpp:5196).
+        self.ndb_functions.push(crate::ndb::NdbFunctionEntry {
+            name: "#globals".to_string(),
+            return_type: NwType::Void,
+            return_struct_name: String::new(),
+            code_start: globals_start as u32,
+            code_end: self.pos() as u32,
+            params: Vec::new(),
+        });
         Ok(())
     }
 
@@ -314,8 +532,16 @@ impl<'a> CodeGenerator<'a> {
         let node = self.arena.get(node_id).clone();
         match node.op {
             Operation::FunctionalUnit => {
-                self.emit_global_var_inits(node.left)?;
-                self.emit_global_var_inits(node.right)?;
+                // Iterate the flat right-linked chain; recurse only into each FU's
+                // (bounded-depth) left declaration. Per-declaration recursion on the
+                // chain overflows the stack on large includes (nwscript.nss).
+                let mut cur = node_id;
+                while cur != NULL_NODE {
+                    let n = self.arena.get(cur).clone();
+                    if n.op != Operation::FunctionalUnit { break; }
+                    self.emit_global_var_inits(n.left)?;
+                    cur = n.right;
+                }
             }
             Operation::GlobalVariables => {
                 if node.left == NULL_NODE { return Ok(()); }
@@ -333,16 +559,33 @@ impl<'a> CodeGenerator<'a> {
                         let var = self.arena.get(vl.left).clone();
                         let name = var.string_data.as_deref().unwrap_or("").to_string();
 
+                        // Record byte position within the global area BEFORE pushing,
+                        // so it corresponds to the first byte of this variable.
+                        let global_byte_offset = self.global_var_size;
+
                         if var.left != NULL_NODE {
                             self.generate_expr(var.left)?;
                         } else {
-                            self.emit_default_value(nw_type);
+                            self.emit_default_value_named(nw_type, &type_name);
                         }
+
+                        // C++ emits an NDB variable entry for each global (resolved
+                        // within #globals' code range, scriptcompfinalcode.cpp:6709-6744).
+                        let code_pos = self.pos() as u32;
+                        self.ndb_variables.push(crate::ndb::NdbVarEntry {
+                            name: name.clone(),
+                            var_type: nw_type,
+                            struct_name: type_name.clone().unwrap_or_default(),
+                            stack_loc: global_byte_offset as u32,
+                            code_start: code_pos,
+                            code_end: code_pos,
+                        });
 
                         self.locals.push(LocalVar {
                             name, nw_type, type_name: type_name.clone(),
-                            stack_offset: self.stack_depth * 4,
+                            stack_offset: global_byte_offset,
                             scope_level: 0, size,
+                            is_global: true,
                         });
                         self.global_var_size += size;
                     }
@@ -355,17 +598,80 @@ impl<'a> CodeGenerator<'a> {
     }
 
     fn emit_default_value(&mut self, nw_type: NwType) {
+        self.emit_default_value_named(nw_type, &None);
+    }
+
+    /// C++ `AddVariableToStack` (scriptcompfinalcode.cpp:6011-6062) emits one
+    /// `RUNSTACK_ADD <type-auxcode>` per uninitialized scalar — not a CONSTI 0.
+    /// Structs recurse over their fields; engine structs use their own auxcode.
+    fn emit_default_value_named(&mut self, nw_type: NwType, type_name: &Option<String>) {
+        self.emit_default_value_named_guarded(nw_type, type_name, &mut Vec::new());
+    }
+
+    fn emit_default_value_named_guarded(
+        &mut self,
+        nw_type: NwType,
+        type_name: &Option<String>,
+        active: &mut Vec<String>,
+    ) {
         match nw_type {
-            NwType::Integer => self.emit_const_int(0),
-            NwType::Float => self.emit_const_float(0.0),
-            NwType::String => self.emit_const_string(""),
-            NwType::Object => self.emit_const_object(0x7f000000u32 as i32),
-            NwType::Vector => {
-                self.emit_const_float(0.0);
-                self.emit_const_float(0.0);
-                self.emit_const_float(0.0);
+            NwType::Integer => {
+                self.emit_op(Opcode::RunstackAdd, NwType::Integer.auxcode());
+                self.stack_depth += 1;
             }
-            _ => self.emit_const_int(0),
+            NwType::Float => {
+                self.emit_op(Opcode::RunstackAdd, NwType::Float.auxcode());
+                self.stack_depth += 1;
+            }
+            NwType::String => {
+                self.emit_op(Opcode::RunstackAdd, NwType::String.auxcode());
+                self.stack_depth += 1;
+            }
+            NwType::Object => {
+                self.emit_op(Opcode::RunstackAdd, NwType::Object.auxcode());
+                self.stack_depth += 1;
+            }
+            NwType::Vector => {
+                self.emit_op(Opcode::RunstackAdd, NwType::Float.auxcode());
+                self.emit_op(Opcode::RunstackAdd, NwType::Float.auxcode());
+                self.emit_op(Opcode::RunstackAdd, NwType::Float.auxcode());
+                self.stack_depth += 3;
+            }
+            NwType::EngineStructure(_) => {
+                self.emit_op(Opcode::RunstackAdd, nw_type.auxcode());
+                self.stack_depth += 1;
+            }
+            NwType::Struct => {
+                if let Some(tn) = type_name {
+                    // Anti-crash depth cap: a legitimately deep ACYCLIC struct chain
+                    // (`struct S0{struct S1 f;} … struct SN{int f;}`) never trips the
+                    // cycle guard below, so without a depth bound it overflows the fixed
+                    // WASM stack (~7000 frames). Cap well below that; no real struct
+                    // nests anywhere near this deep.
+                    if active.len() >= 1000 {
+                        return;
+                    }
+                    // Break cycles in the struct type graph. C++ never builds such a
+                    // cycle (its lexer rejects the forward struct reference at parse
+                    // time); our more-lenient parser can, so guard against unbounded
+                    // recursion on `struct A{struct B b;} struct B{struct A a;}`.
+                    if active.iter().any(|n| n == tn) {
+                        return;
+                    }
+                    let sd = self.struct_defs.iter().find(|s| s.name == *tn).cloned();
+                    if let Some(sd) = sd {
+                        active.push(tn.clone());
+                        for f in &sd.fields {
+                            self.emit_default_value_named_guarded(f.nw_type, &f.type_name, active);
+                        }
+                        active.pop();
+                    }
+                }
+            }
+            NwType::Void | NwType::Action => {
+                self.emit_op(Opcode::RunstackAdd, NwType::Integer.auxcode());
+                self.stack_depth += 1;
+            }
         }
     }
 
@@ -373,8 +679,14 @@ impl<'a> CodeGenerator<'a> {
         if node_id == NULL_NODE { return Ok(()); }
         let node = self.arena.get(node_id).clone();
         if node.op == Operation::FunctionalUnit {
-            self.emit_all_functions(node.left)?;
-            self.emit_all_functions(node.right)?;
+            // Iterate the flat chain; recurse only into each FU's bounded-depth left.
+            let mut cur = node_id;
+            while cur != NULL_NODE {
+                let n = self.arena.get(cur).clone();
+                if n.op != Operation::FunctionalUnit { break; }
+                self.emit_all_functions(n.left)?;
+                cur = n.right;
+            }
             return Ok(());
         }
         if node.op == Operation::Function {
@@ -417,35 +729,47 @@ impl<'a> CodeGenerator<'a> {
     }
 
     fn find_function_body(&self, node_id: NodeId, name: &str) -> Option<NodeId> {
-        if node_id == NULL_NODE { return None; }
-        let node = self.arena.get(node_id);
-        if node.op == Operation::FunctionalUnit {
-            if let Some(b) = self.find_function_body(node.left, name) { return Some(b); }
-            return self.find_function_body(node.right, name);
-        }
-        if node.op == Operation::Function && node.left != NULL_NODE {
-            let fid = self.arena.get(node.left);
-            if fid.string_data.as_deref() == Some(name) {
-                return Some(node.right);
+        // Iterate the flat FunctionalUnit chain; recurse only into each bounded left.
+        let mut cur = node_id;
+        while cur != NULL_NODE {
+            let node = self.arena.get(cur);
+            if node.op == Operation::FunctionalUnit {
+                let left = node.left;
+                let right = node.right;
+                if let Some(b) = self.find_function_body(left, name) { return Some(b); }
+                cur = right;
+                continue;
             }
+            if node.op == Operation::Function && node.left != NULL_NODE {
+                let fid = self.arena.get(node.left);
+                if fid.string_data.as_deref() == Some(name) {
+                    return Some(node.right);
+                }
+            }
+            break;
         }
         None
     }
 
     fn collect_calls(&self, node_id: NodeId, out: &mut Vec<String>) {
-        if node_id == NULL_NODE { return; }
-        let node = self.arena.get(node_id);
-        if node.op == Operation::Action && node.left != NULL_NODE {
-            let aid = self.arena.get(node.left);
-            if let Some(n) = &aid.string_data {
-                // Only collect user functions, not engine actions
-                if self.func_sigs.iter().any(|f| f.name == *n && !f.is_engine_action) {
-                    out.push(n.clone());
+        // Explicit-stack walk over a whole function body (recursion overflows on
+        // large bodies). Order doesn't matter — `out` is a reachability set.
+        let mut stack = vec![node_id];
+        while let Some(id) = stack.pop() {
+            if id == NULL_NODE { continue; }
+            let node = self.arena.get(id);
+            if node.op == Operation::Action && node.left != NULL_NODE {
+                let aid = self.arena.get(node.left);
+                if let Some(n) = &aid.string_data {
+                    // Only collect user functions, not engine actions
+                    if self.func_sigs.iter().any(|f| f.name == *n && !f.is_engine_action) {
+                        out.push(n.clone());
+                    }
                 }
             }
+            if node.right != NULL_NODE { stack.push(node.right); }
+            if node.left != NULL_NODE { stack.push(node.left); }
         }
-        self.collect_calls(node.left, out);
-        self.collect_calls(node.right, out);
     }
 
     fn emit_function(&mut self, node_id: NodeId) -> Result<(), CompileError> {
@@ -458,6 +782,7 @@ impl<'a> CodeGenerator<'a> {
         self.add_label(&func_name);
         self.current_func_name = Some(func_name.clone());
         self.current_return_type = return_type;
+        self.current_return_type_name = fid.type_name.clone();
         self.current_func_start = self.pos();
 
         let saved_locals = self.locals.len();
@@ -486,6 +811,7 @@ impl<'a> CodeGenerator<'a> {
             self.locals.push(LocalVar {
                 name: name.clone(), nw_type: *nw_type, type_name: type_name.clone(),
                 stack_offset: param_offset, scope_level: 1, size: *size,
+                is_global: false,
             });
             param_offset += size;
         }
@@ -508,7 +834,17 @@ impl<'a> CodeGenerator<'a> {
             self.emit_modify_sp(-local_alloc);
         }
 
-        self.emit_op(Opcode::Ret, 0);
+        // Skip the trailing RET if the body's last emitted instruction already is a
+        // RET — but only when the RET was emitted INSIDE this function's code range.
+        // (Otherwise an empty function placed after a function that ends in RET would
+        // see the previous function's RET and emit nothing for itself.)
+        let pos = self.pos();
+        let already_ret = pos >= self.current_func_start + 2
+            && self.code[pos - 2] == Opcode::Ret as u8
+            && self.code[pos - 1] == 0;
+        if !already_ret {
+            self.emit_op(Opcode::Ret, 0);
+        }
 
         // Record NDB function entry
         let func_end = self.pos();
@@ -571,14 +907,42 @@ impl<'a> CodeGenerator<'a> {
                 self.stack_depth = saved_depth;
             }
             Operation::StatementList => {
-                self.generate_stmt(node.left)?;
-                self.generate_stmt(node.right)?;
+                // Iterate the right-linked statement chain; recurse only into each
+                // statement (node.left). A 2000+-statement function body overflows
+                // the stack if the chain is walked recursively.
+                let mut cur = node_id;
+                while cur != NULL_NODE {
+                    let n = self.arena.get(cur).clone();
+                    if n.op != Operation::StatementList {
+                        // Not a list link — emit it as a single statement and stop.
+                        self.generate_stmt(cur)?;
+                        break;
+                    }
+                    self.generate_stmt(n.left)?;
+                    cur = n.right;
+                }
             }
             Operation::Statement | Operation::StatementNoDebug => {
                 let line_start = self.pos();
                 let line = node.line;
                 let file_id = node.file_id;
+                // C++ STATEMENT InVisit (scriptcompfinalcode.cpp:1449) records the
+                // SP before, then the PostVisit (2240-2267) emits MODIFY_STACK_POINTER
+                // to drop any unused expression value — EXCEPT when the inner op is
+                // a KEYWORD_DECLARATION / CONST_DECLARATION (locals stay live until
+                // their enclosing CompoundStatement closes).
+                let saved_depth = self.stack_depth;
+                let inner_is_decl = node.left != NULL_NODE && {
+                    let inner = self.arena.get(node.left);
+                    matches!(inner.op, Operation::KeywordDeclaration | Operation::ConstDeclaration)
+                };
                 self.generate_stmt(node.left)?;
+                if !inner_is_decl {
+                    let delta = (self.stack_depth - saved_depth) * 4;
+                    if delta > 0 {
+                        self.emit_modify_sp(-delta);
+                    }
+                }
                 let line_end = self.pos();
                 if node.op == Operation::Statement && line > 0 && line_end > line_start {
                     self.ndb_lines.push(crate::ndb::NdbLineEntry {
@@ -596,18 +960,48 @@ impl<'a> CodeGenerator<'a> {
             Operation::WhileBlock => self.gen_while(node_id)?,
             Operation::DoWhileBlock => self.gen_do_while(node_id)?,
             Operation::ForBlock => self.generate_stmt(node.left)?,
+            // A plain `while` body reaches gen_while as the WhileChoice wrapper
+            // (extract_for_update only unwraps the for-desugar form). Emit its body.
+            Operation::WhileChoice => self.generate_stmt(node.left)?,
             Operation::SwitchBlock => self.gen_switch(node_id)?,
             Operation::Return => self.gen_return(node_id)?,
             Operation::Break => {
+                // C++ scriptcompfinalcode.cpp:5715 picks the innermost enclosing
+                // loop or switch via code-offset comparison (whichever was entered
+                // later, i.e. has the larger code offset, is innermost).
+                let s_off = self.switch_entry_offset_stack.last().copied();
+                let l_off = self.loop_entry_offset_stack.last().copied();
+                let s_depth = self.switch_entry_depth_stack.last().copied();
+                let l_depth = self.loop_entry_depth_stack.last().copied();
+                let target_depth = match (s_off, l_off) {
+                    (Some(so), Some(lo)) => {
+                        if so >= lo { s_depth } else { l_depth }
+                    }
+                    (Some(_), None) => s_depth,
+                    (None, Some(_)) => l_depth,
+                    (None, None) => None,
+                };
+                if let Some(td) = target_depth {
+                    let delta = (self.stack_depth - td) * 4;
+                    if delta > 0 {
+                        self.emit_modify_sp(-delta);
+                    }
+                }
                 let fix = self.emit_jmp_placeholder(Opcode::Jmp);
                 if let Some(exits) = self.break_fixup_stack.last_mut() {
                     exits.push(fix);
                 }
             }
             Operation::Continue => {
+                // C++: same SP rollback for continue inside loops.
+                if let Some(&td) = self.loop_entry_depth_stack.last() {
+                    let delta = (self.stack_depth - td) * 4;
+                    if delta > 0 {
+                        self.emit_modify_sp(-delta);
+                    }
+                }
                 if let Some(&target) = self.loop_start_stack.last() {
                     if target == usize::MAX {
-                        // For-loop: continue jumps to update expression — register a fixup
                         let fix = self.emit_jmp_placeholder(Opcode::Jmp);
                         if let Some(fixups) = self.continue_fixup_stack.last_mut() {
                             fixups.push(fix);
@@ -636,12 +1030,17 @@ impl<'a> CodeGenerator<'a> {
             if vl.left != NULL_NODE {
                 let var = self.arena.get(vl.left).clone();
                 let name = var.string_data.as_deref().unwrap_or("").to_string();
+                // C++ scriptcompfinalcode.cpp:2818 / 5293 / 5404 sets
+                // m_nVarRunTimeLocation = m_nStackCurrentDepth * 4 BEFORE the value
+                // is pushed. Reading uses `nIntegerData - m_nStackCurrentDepth*4`,
+                // so the first local reads at offset -4 (below SP). Capture the
+                // offset BEFORE the push to match.
+                let offset = self.stack_depth * 4;
                 if var.left != NULL_NODE {
                     self.generate_expr(var.left)?;
                 } else {
-                    self.emit_default_value(nw_type);
+                    self.emit_default_value_named(nw_type, &type_name);
                 }
-                let offset = self.stack_depth * 4;
 
                 // NDB: record variable lifetime starting here
                 let code_start = self.pos();
@@ -657,6 +1056,7 @@ impl<'a> CodeGenerator<'a> {
                 self.locals.push(LocalVar {
                     name, nw_type, type_name: type_name.clone(),
                     stack_offset: offset, scope_level: self.scope_level, size,
+                    is_global: false,
                 });
             }
             vl_id = vl.right;
@@ -706,6 +1106,8 @@ impl<'a> CodeGenerator<'a> {
             loop_top
         };
         self.loop_start_stack.push(continue_target_placeholder);
+        self.loop_entry_depth_stack.push(self.stack_depth);
+        self.loop_entry_offset_stack.push(self.pos());
         self.break_fixup_stack.push(Vec::new());
         // Track break fixups also for continue if it's a for-loop
         // (continue jumps to update which is after body but before back-jump)
@@ -742,10 +1144,18 @@ impl<'a> CodeGenerator<'a> {
                     *top = update_pos;
                 }
             }
-            // Emit the update expression
+            // C++ wraps the for-loop UPDATE in a STATEMENT node whose post-visit
+            // (scriptcompfinalcode.cpp:2256-2267) emits MODIFY_STACK_POINTER to drop
+            // any residue from the update expression (e.g. an int-returning call).
+            // Rust parses the update bare, so emit the same cleanup here.
             let upd = self.arena.get(update_node).clone();
             if upd.left != NULL_NODE {
+                let saved_depth = self.stack_depth;
                 self.generate_expr(upd.left)?;
+                let delta = (self.stack_depth - saved_depth) * 4;
+                if delta > 0 {
+                    self.emit_modify_sp(-delta);
+                }
             }
         }
 
@@ -757,6 +1167,8 @@ impl<'a> CodeGenerator<'a> {
             self.continue_fixup_stack.pop();
         }
         self.loop_start_stack.pop();
+        self.loop_entry_depth_stack.pop();
+        self.loop_entry_offset_stack.pop();
         Ok(())
     }
 
@@ -794,6 +1206,8 @@ impl<'a> CodeGenerator<'a> {
         let node = self.arena.get(node_id).clone();
         let loop_top = self.pos();
         self.loop_start_stack.push(loop_top);
+        self.loop_entry_depth_stack.push(self.stack_depth);
+        self.loop_entry_offset_stack.push(self.pos());
         self.break_fixup_stack.push(Vec::new());
 
         self.generate_stmt(node.left)?;
@@ -807,53 +1221,102 @@ impl<'a> CodeGenerator<'a> {
 
         for f in self.break_fixup_stack.pop().unwrap_or_default() { self.patch_jmp_here(f); }
         self.loop_start_stack.pop();
+        self.loop_entry_depth_stack.pop();
+        self.loop_entry_offset_stack.pop();
         Ok(())
     }
 
     fn gen_switch(&mut self, node_id: NodeId) -> Result<(), CompileError> {
         let node = self.arena.get(node_id).clone();
-        self.break_fixup_stack.push(Vec::new());
 
         if node.left != NULL_NODE {
             let cond = self.arena.get(node.left).clone();
             if cond.left != NULL_NODE { self.generate_expr(cond.left)?; }
         }
-        self.gen_switch_body(node.right)?;
-        self.emit_modify_sp(-4); // pop switch expression
 
+        // C++ scriptcompfinalcode.cpp:5748-5752: break inside switch rolls SP to
+        // (m_nSwitchStackDepth + 1) — i.e. the depth WITH the switch expression
+        // on the stack. Record entry depth AFTER pushing the expression so a break
+        // leaves the expression alone; the final MODIFY_SP at switch exit pops it.
+        let entry_depth = self.stack_depth;
+        self.switch_entry_depth_stack.push(entry_depth);
+        self.switch_entry_offset_stack.push(self.pos());
+        self.break_fixup_stack.push(Vec::new());
+
+        self.gen_switch_body(node.right)?;
+
+        // Patch break fixups to point HERE — break jumps to the same single MODIFY_SP
+        // that handles the natural exit, popping the switch expression exactly once.
         for f in self.break_fixup_stack.pop().unwrap_or_default() { self.patch_jmp_here(f); }
+        self.emit_modify_sp(-4); // pop switch expression
+        self.switch_entry_depth_stack.pop();
+        self.switch_entry_offset_stack.pop();
         Ok(())
     }
 
     fn gen_switch_body(&mut self, node_id: NodeId) -> Result<(), CompileError> {
-        // Collect all items in the switch body into a flat list
+        // Two-pass approach matching C++ (scriptcompfinalcode.cpp `GenerateCodeForSwitchLabels`):
+        // 1. Pre-emit the dispatch table — for each case label, COPYTOP + CONST + EQUAL + JNZ → label
+        //    Followed by a final JMP to the default label, or past the switch if none.
+        // 2. Emit the body. CASE / Default nodes become pure labels (no extra code).
         let mut items = Vec::new();
         self.flatten_switch_items(node_id, &mut items);
 
-        let mut case_miss_fixup: Option<usize> = None;
-
-        for item_id in items {
+        // Pass 1: dispatch.
+        // For each case we record (item_index_in_items, jnz_fixup).
+        let mut case_jumps: Vec<(usize, usize)> = Vec::new();
+        let mut default_jump: Option<(usize, usize)> = None; // (item_index, jmp_fixup)
+        for (i, &item_id) in items.iter().enumerate() {
             let item = self.arena.get(item_id).clone();
             match item.op {
                 Operation::Case => {
-                    // Patch previous case-miss to jump here
-                    if let Some(fixup) = case_miss_fixup.take() {
-                        self.patch_jmp_here(fixup);
-                    }
-                    // Dup switch expr, compare with case value
-                    self.emit_op(Opcode::RunstackCopy, 0);
+                    // dup switch expression
+                    self.emit_op(Opcode::RunstackCopy, 0x01);
                     self.emit_i32(-4); self.emit_u16(4);
                     self.stack_depth += 1;
-                    if item.left != NULL_NODE { self.generate_expr(item.left)?; }
+                    if item.left != NULL_NODE {
+                        let case_val = self.arena.get(item.left).clone();
+                        if case_val.op == Operation::ConstantString {
+                            let s = case_val.string_data.as_deref().unwrap_or("");
+                            let h = crate::xxh32::cexo_string_hash(s);
+                            self.emit_const_int(h);
+                        } else {
+                            self.generate_expr(item.left)?;
+                        }
+                    }
                     self.emit_op(Opcode::Equal, 0x20);
                     self.stack_depth -= 1;
-                    let jz = self.emit_jmp_placeholder(Opcode::Jz);
+                    let jnz = self.emit_jmp_placeholder(Opcode::Jnz);
                     self.stack_depth -= 1;
-                    case_miss_fixup = Some(jz);
+                    case_jumps.push((i, jnz));
                 }
                 Operation::Default => {
-                    if let Some(fixup) = case_miss_fixup.take() {
-                        self.patch_jmp_here(fixup);
+                    // Defer — emit final JMP to default once we've finished the dispatch table.
+                    default_jump = Some((i, usize::MAX));
+                }
+                _ => {}
+            }
+        }
+        // Final JMP at the end of dispatch — to default (if present) or past the switch body.
+        let final_jmp_fixup = self.emit_jmp_placeholder(Opcode::Jmp);
+
+        // Pass 2: body. Each Case / Default acts as a label — patch the corresponding jump here.
+        for (i, &item_id) in items.iter().enumerate() {
+            let item = self.arena.get(item_id).clone();
+            match item.op {
+                Operation::Case => {
+                    // Find this case's pre-emitted JNZ and patch it to here.
+                    if let Some(&(_, jnz)) = case_jumps.iter().find(|(idx, _)| *idx == i) {
+                        self.patch_jmp_here(jnz);
+                    }
+                }
+                Operation::Default => {
+                    if let Some((idx, _)) = default_jump {
+                        if idx == i {
+                            // Patch the final dispatch JMP to here (the default label).
+                            self.patch_jmp_here(final_jmp_fixup);
+                            default_jump = Some((idx, 0)); // mark patched
+                        }
                     }
                 }
                 _ => {
@@ -862,50 +1325,52 @@ impl<'a> CodeGenerator<'a> {
             }
         }
 
-        // Patch final case-miss to fall through to switch exit
-        if let Some(fixup) = case_miss_fixup {
-            self.patch_jmp_here(fixup);
+        // If there was no default, the dispatch JMP falls through to switch exit.
+        if let Some((_, 0)) = default_jump {
+            // already patched at the Default label
+        } else if default_jump.is_none() {
+            self.patch_jmp_here(final_jmp_fixup);
         }
 
         Ok(())
     }
 
     fn flatten_switch_items(&self, node_id: NodeId, items: &mut Vec<NodeId>) {
-        if node_id == NULL_NODE { return; }
-        let node = self.arena.get(node_id);
-        if node.op == Operation::StatementList {
-            self.flatten_switch_items(node.left, items);
-            self.flatten_switch_items(node.right, items);
-        } else {
-            items.push(node_id);
+        // Explicit-stack in-order flatten (recursion overflows on ~500+ case bodies).
+        // Push right then left so left is emitted first, preserving source order.
+        let mut stack = vec![node_id];
+        while let Some(id) = stack.pop() {
+            if id == NULL_NODE { continue; }
+            let node = self.arena.get(id);
+            if node.op == Operation::StatementList {
+                stack.push(node.right);
+                stack.push(node.left);
+            } else {
+                items.push(id);
+            }
         }
     }
 
     fn gen_return(&mut self, node_id: NodeId) -> Result<(), CompileError> {
         let node = self.arena.get(node_id).clone();
         if node.left != NULL_NODE {
-            let ret_size = self.type_size(self.current_return_type, &None);
+            let ret_type_name = self.current_return_type_name.clone();
+            let ret_size = self.type_size(self.current_return_type, &ret_type_name);
             self.generate_expr(node.left)?;
 
             // Copy return value to caller's reserved slot.
-            // The slot offset was computed relative to function entry SP=0;
-            // adjust for current SP which includes the just-pushed return value.
             if ret_size > 0 {
                 let target_offset = self.current_return_slot_offset - self.stack_depth * 4;
-                self.emit_op(Opcode::Assignment, 0);
+                self.emit_op(Opcode::Assignment, 0x01);
                 self.emit_i32(target_offset);
                 self.emit_u16(ret_size as u16);
-                // The just-pushed value gets consumed by the ASSIGNMENT? In NWScript VM,
-                // ASSIGNMENT copies but doesn't pop. Pop it manually.
-                self.emit_modify_sp(-ret_size);
             }
         }
-        // Clean up local variables
-        let local_size: i32 = self.locals.iter()
-            .filter(|l| l.scope_level > 0 && l.stack_offset >= 0)
-            .map(|l| l.size).sum();
-        if local_size > 0 {
-            self.emit_modify_sp(-local_size);
+        // C++ scriptcompfinalcode.cpp:5469-5503 emits ONE MODIFY_STACK_POINTER that
+        // pops the return value AND every leftover local in a single instruction.
+        let pop_bytes = (self.stack_depth - self.base_stack_depth) * 4;
+        if pop_bytes > 0 {
+            self.emit_modify_sp(-pop_bytes);
         }
         self.emit_op(Opcode::Ret, 0);
         Ok(())
@@ -915,6 +1380,18 @@ impl<'a> CodeGenerator<'a> {
 
     fn generate_expr(&mut self, node_id: NodeId) -> Result<NwType, CompileError> {
         if node_id == NULL_NODE { return Ok(NwType::Void); }
+        // Defense-in-depth stack guard (semcheck already caps deep operator chains).
+        self.expr_depth += 1;
+        if self.expr_depth > 2000 {
+            self.expr_depth -= 1;
+            return Err(CompileError::UnexpectedCharacter);
+        }
+        let r = self.generate_expr_inner(node_id);
+        self.expr_depth -= 1;
+        r
+    }
+
+    fn generate_expr_inner(&mut self, node_id: NodeId) -> Result<NwType, CompileError> {
         let node = self.arena.get(node_id).clone();
 
         match node.op {
@@ -959,21 +1436,36 @@ impl<'a> CodeGenerator<'a> {
             // ---- Variables ----
             Operation::Variable => {
                 let name = node.string_data.as_deref().unwrap_or("");
-                if let Some((so, sz, nt, _tn)) = self.find_local(name) {
-                    let offset = so - self.stack_depth * 4;
-                    self.emit_op(Opcode::RunstackCopy, 0);
-                    self.emit_i32(offset);
-                    self.emit_u16(sz as u16);
+                if let Some((so, sz, nt, _tn, is_global)) = self.find_var(name) {
+                    if is_global {
+                        let bp_offset = so - self.global_var_size;
+                        self.emit_op(Opcode::RunstackCopyBase, 0x01);
+                        self.emit_i32(bp_offset);
+                        self.emit_u16(sz as u16);
+                    } else {
+                        let offset = so - self.stack_depth * 4;
+                        self.emit_op(Opcode::RunstackCopy, 0x01);
+                        self.emit_i32(offset);
+                        self.emit_u16(sz as u16);
+                    }
                     self.stack_depth += sz / 4;
                     Ok(nt)
+                } else if let Some(dv) = self.const_values.get(name).cloned() {
+                    // Not a local/global variable, but a `const` — fold to its literal
+                    // value (C++ inlines const references; consts have no storage).
+                    use crate::semcheck::DefaultValue as DV;
+                    let t = match &dv {
+                        DV::Integer(_) => NwType::Integer,
+                        DV::Float(_) => NwType::Float,
+                        DV::String(_) => NwType::String,
+                        DV::Object(_) => NwType::Object,
+                        DV::Vector(_, _, _) => NwType::Vector,
+                        DV::EngineStruct => NwType::Void,
+                    };
+                    self.emit_default_value_from(&dv);
+                    Ok(t)
                 } else {
-                    // Global variable — use base-pointer-relative access
-                    // Globals are below the base pointer, addressed with RunstackCopyBase
-                    self.emit_op(Opcode::RunstackCopyBase, 0);
-                    self.emit_i32(-(self.global_var_size)); // offset from base pointer
-                    self.emit_u16(4);
-                    self.stack_depth += 1;
-                    Ok(NwType::Integer)
+                    Ok(NwType::Void)
                 }
             }
 
@@ -983,9 +1475,10 @@ impl<'a> CodeGenerator<'a> {
                 let is_compound = op_token != crate::token::TokenType::AssignmentEqual as i32
                     && op_token != 0;
 
+                let mut lhs_type = NwType::Void;
                 if is_compound && node.left != NULL_NODE {
                     // Compound assignment (+=, -=, etc.): load current value first
-                    self.generate_expr(node.left)?;
+                    lhs_type = self.generate_expr(node.left)?;
                 }
 
                 let rt = self.generate_expr(node.right)?;
@@ -1007,7 +1500,9 @@ impl<'a> CodeGenerator<'a> {
                         _ => None,
                     };
                     if let Some(op) = compound_op {
-                        self.emit_op(op, 0x20);
+                        // C++: auxcode is derived from operand types, not hardcoded
+                        let aux = lhs_type.auxcode_pair(rt).unwrap_or(0x20);
+                        self.emit_op(op, aux);
                         self.stack_depth -= 1;
                     }
                 }
@@ -1016,11 +1511,18 @@ impl<'a> CodeGenerator<'a> {
                     let lhs = self.arena.get(node.left).clone();
                     if lhs.op == Operation::Variable {
                         let name = lhs.string_data.as_deref().unwrap_or("");
-                        if let Some((so, sz, _, _)) = self.find_local(name) {
-                            let offset = so - self.stack_depth * 4;
-                            self.emit_op(Opcode::Assignment, 0);
-                            self.emit_i32(offset);
-                            self.emit_u16(sz as u16);
+                        if let Some((so, sz, _, _, is_global)) = self.find_var(name) {
+                            if is_global {
+                                let bp_offset = so - self.global_var_size;
+                                self.emit_op(Opcode::AssignmentBase, 0x01);
+                                self.emit_i32(bp_offset);
+                                self.emit_u16(sz as u16);
+                            } else {
+                                let offset = so - self.stack_depth * 4;
+                                self.emit_op(Opcode::Assignment, 0x01);
+                                self.emit_i32(offset);
+                                self.emit_u16(sz as u16);
+                            }
                         }
                     } else if lhs.op == Operation::StructurePart {
                         self.gen_struct_field_assign(&lhs)?;
@@ -1043,8 +1545,19 @@ impl<'a> CodeGenerator<'a> {
                     _ => unreachable!(),
                 };
                 self.emit_op(op, lt.auxcode_pair(rt).unwrap_or(0x20));
-                self.stack_depth -= 1;
-                Ok(if lt == NwType::Float || rt == NwType::Float { NwType::Float } else { lt })
+                // Stack accounting per C++ scriptcompfinalcode.cpp:4503-4591:
+                //   vec+vec: pop 6 slots, push 3 → net -3
+                //   vec*float / float*vec: pop 4 slots, push 3 → net -1
+                //   string+string / int+int / float+float etc: pop 2 slots, push 1 → net -1
+                let (result_type, sp_delta) = match (lt, rt) {
+                    (NwType::Vector, NwType::Vector) => (NwType::Vector, -3),
+                    (NwType::Vector, NwType::Float) | (NwType::Float, NwType::Vector) => (NwType::Vector, -1),
+                    (NwType::Float, _) | (_, NwType::Float) => (NwType::Float, -1),
+                    (NwType::String, NwType::String) if node.op == Operation::Add => (NwType::String, -1),
+                    _ => (NwType::Integer, -1),
+                };
+                self.stack_depth += sp_delta;
+                Ok(result_type)
             }
             Operation::Negation => {
                 let t = self.generate_expr(node.left)?;
@@ -1062,29 +1575,57 @@ impl<'a> CodeGenerator<'a> {
                 Ok(NwType::Integer)
             }
 
-            // ---- Logical (short-circuit) ----
+            // ---- Logical AND / OR ----
+            // C++ scriptcompfinalcode.cpp:2412-2466 + 3932-4010 emits BOTH a short-circuit
+            // (RUNSTACK_COPY top + JZ/JNZ past the right operand and the opcode) AND a
+            // final LogicalAnd / LogicalOr opcode. When the short-circuit fires, the
+            // result is the (already-on-stack) left value; when it doesn't, LogicalAnd
+            // / LogicalOr consumes both operands and pushes the normalised result.
             Operation::LogicalAnd => {
                 self.generate_expr(node.left)?;
+                // Copy top, JZ-skip if zero: keeps the left value on stack.
+                self.emit_op(Opcode::RunstackCopy, 0x01);
+                self.emit_i32(-4);
+                self.emit_u16(4);
+                self.stack_depth += 1;
                 let jz = self.emit_jmp_placeholder(Opcode::Jz);
                 self.stack_depth -= 1;
                 self.generate_expr(node.right)?;
-                let jmp = self.emit_jmp_placeholder(Opcode::Jmp);
+                self.emit_op(Opcode::LogicalAnd, 0x20);
                 self.stack_depth -= 1;
                 self.patch_jmp_here(jz);
-                self.emit_const_int(0);
-                self.patch_jmp_here(jmp);
                 Ok(NwType::Integer)
             }
             Operation::LogicalOr => {
+                // Mirror C++ scriptcompfinalcode.cpp (InVisit :2468, PostVisit :3971).
+                // Unlike `&&`, the short-circuit value for `||` is the *truthy* left
+                // operand, which must still be normalised to 1 through the LOGOR op —
+                // so C++ does NOT skip the opcode. It copies the left value, and on the
+                // truthy path makes a *second* copy and jumps straight to LOGOR (which
+                // pops both copies and pushes `left||left` == 1). On the falsy path the
+                // JZ pops the first copy and falls through to the right operand.
                 self.generate_expr(node.left)?;
-                let jnz = self.emit_jmp_placeholder(Opcode::Jnz);
+                // COPY top -> [left, left]
+                self.emit_op(Opcode::RunstackCopy, 0x01);
+                self.emit_i32(-4);
+                self.emit_u16(4);
+                self.stack_depth += 1;
+                // JZ (pops the copy): left falsy -> evaluate the right operand.
+                let jz = self.emit_jmp_placeholder(Opcode::Jz);
                 self.stack_depth -= 1;
-                self.generate_expr(node.right)?;
+                // Truthy path: second copy (intentionally NOT tracked on the stack, per
+                // C++) then jump over the right operand straight to LOGOR.
+                self.emit_op(Opcode::RunstackCopy, 0x01);
+                self.emit_i32(-4);
+                self.emit_u16(4);
                 let jmp = self.emit_jmp_placeholder(Opcode::Jmp);
-                self.stack_depth -= 1;
-                self.patch_jmp_here(jnz);
-                self.emit_const_int(1);
+                // Falsy path lands here, evaluates the right operand.
+                self.patch_jmp_here(jz);
+                self.generate_expr(node.right)?;
+                // Both paths converge on LOGOR.
                 self.patch_jmp_here(jmp);
+                self.emit_op(Opcode::LogicalOr, 0x20);
+                self.stack_depth -= 1;
                 Ok(NwType::Integer)
             }
 
@@ -1122,8 +1663,29 @@ impl<'a> CodeGenerator<'a> {
                     Operation::ConditionLEQ => Opcode::LEQ,
                     _ => unreachable!(),
                 };
-                self.emit_op(op, lt.auxcode_pair(rt).unwrap_or(0x20));
-                self.stack_depth -= 1;
+                // C++ treats vector == / != as a STRUCT_STRUCT compare (aux 0x24, size 12)
+                let mut aux = lt.auxcode_pair(rt).unwrap_or(0x20);
+                let mut emit_size: Option<u16> = None;
+                let mut pop_slots = 1i32;
+                if matches!(node.op, Operation::ConditionEqual | Operation::ConditionNotEqual)
+                    && lt == NwType::Vector && rt == NwType::Vector
+                {
+                    aux = 0x24;
+                    emit_size = Some(12);
+                    pop_slots = (12 / 4) * 2 - 1;
+                } else if aux == 0x24 {
+                    // C++ scriptcompfinalcode.cpp:4225-4263 emits GetStructureSize as the
+                    // 2-byte size operand. The struct name must be resolved from the
+                    // operand expression (a Variable's type_name is NOT set on the AST
+                    // node — resolve via the symbol tables, like field reads do).
+                    let name = self.resolve_expr_struct_name(node.left);
+                    let sz = name.as_deref().map(|n| self.struct_size(n)).unwrap_or(0);
+                    emit_size = Some(sz as u16);
+                    pop_slots = (sz / 4) * 2 - 1;
+                }
+                self.emit_op(op, aux);
+                if let Some(sz) = emit_size { self.emit_u16(sz); }
+                self.stack_depth -= pop_slots;
                 Ok(NwType::Integer)
             }
 
@@ -1145,17 +1707,26 @@ impl<'a> CodeGenerator<'a> {
                 let jz = self.emit_jmp_placeholder(Opcode::Jz);
                 self.stack_depth -= 1;
                 let mut rt = NwType::Void;
+                let mut result_slots = 1i32;
                 if node.right != NULL_NODE {
                     let choice = self.arena.get(node.right).clone();
+                    // C++ scriptcompfinalcode.cpp:2392-2398: between the two branches the
+                    // compile-time stack is rolled back by the then-branch result's slot
+                    // count (GetStructureSize for structs, 12 for vectors, 4 otherwise).
+                    // Measure how many slots the then-branch actually pushed rather than
+                    // relying on a possibly-unannotated AST type name.
+                    let depth_before = self.stack_depth;
                     rt = self.generate_expr(choice.left)?;
+                    result_slots = (self.stack_depth - depth_before).max(1);
                     let jmp = self.emit_jmp_placeholder(Opcode::Jmp);
-                    self.stack_depth -= 1;
+                    self.stack_depth -= result_slots;
                     self.patch_jmp_here(jz);
                     self.generate_expr(choice.right)?;
                     self.patch_jmp_here(jmp);
                 } else {
                     self.patch_jmp_here(jz);
                 }
+                let _ = result_slots;
                 Ok(rt)
             }
 
@@ -1181,25 +1752,72 @@ impl<'a> CodeGenerator<'a> {
         let node = self.arena.get(node_id).clone();
         if node.left != NULL_NODE {
             let lhs = self.arena.get(node.left).clone();
-            if lhs.op == Operation::Variable {
-                let name = lhs.string_data.as_deref().unwrap_or("");
-                if let Some((so, sz, _, _)) = self.find_local(name) {
+            // ++/-- on a struct field: resolve the underlying variable + field offset.
+            if lhs.op == Operation::StructurePart {
+                if let Some((so, sz, is_global)) = self.resolve_struct_field_lvalue(node.left) {
+                    let (read_op, mod_op, off_for_read, off_for_mod) = if is_global {
+                        let base = so - self.global_var_size;
+                        (Opcode::RunstackCopyBase,
+                         match opcode {
+                            Opcode::Increment => Opcode::IncrementBase,
+                            Opcode::Decrement => Opcode::DecrementBase,
+                            x => x,
+                         },
+                         base, base)
+                    } else {
+                        let sp_off = so - self.stack_depth * 4;
+                        (Opcode::RunstackCopy, opcode, sp_off, so)
+                    };
                     if !is_pre {
-                        // post: push old value first
-                        let offset = so - self.stack_depth * 4;
-                        self.emit_op(Opcode::RunstackCopy, 0);
-                        self.emit_i32(offset);
+                        self.emit_op(read_op, 0x01);
+                        self.emit_i32(off_for_read);
                         self.emit_u16(sz as u16);
                         self.stack_depth += sz / 4;
                     }
-                    let offset = so - self.stack_depth * 4;
-                    self.emit_op(opcode, 0x03);
-                    self.emit_i32(offset);
+                    let mod_off = if is_global { off_for_mod } else { so - self.stack_depth * 4 };
+                    self.emit_op(mod_op, 0x03);
+                    self.emit_i32(mod_off);
                     if is_pre {
-                        // pre: push new value after increment
-                        let offset = so - self.stack_depth * 4;
-                        self.emit_op(Opcode::RunstackCopy, 0);
-                        self.emit_i32(offset);
+                        let post_off = if is_global { off_for_mod } else { so - self.stack_depth * 4 };
+                        self.emit_op(read_op, 0x01);
+                        self.emit_i32(post_off);
+                        self.emit_u16(sz as u16);
+                        self.stack_depth += sz / 4;
+                    }
+                    return Ok(NwType::Integer);
+                }
+            }
+            if lhs.op == Operation::Variable {
+                let name = lhs.string_data.as_deref().unwrap_or("");
+                if let Some((so, sz, _, _, is_global)) = self.find_var(name) {
+                    // For globals, use *Base opcodes with BP-relative offset.
+                    let (read_op, mod_op, sp_off, bp_off) = if is_global {
+                        let base = so - self.global_var_size;
+                        (Opcode::RunstackCopyBase,
+                         match opcode {
+                            Opcode::Increment => Opcode::IncrementBase,
+                            Opcode::Decrement => Opcode::DecrementBase,
+                            x => x,
+                         },
+                         base, base)
+                    } else {
+                        (Opcode::RunstackCopy, opcode, so - self.stack_depth * 4, so)
+                    };
+                    if !is_pre {
+                        // post: push old value first
+                        let off = if is_global { bp_off } else { sp_off };
+                        self.emit_op(read_op, 0x01);
+                        self.emit_i32(off);
+                        self.emit_u16(sz as u16);
+                        self.stack_depth += sz / 4;
+                    }
+                    let mod_off = if is_global { bp_off } else { so - self.stack_depth * 4 };
+                    self.emit_op(mod_op, 0x03);
+                    self.emit_i32(mod_off);
+                    if is_pre {
+                        let off = if is_global { bp_off } else { so - self.stack_depth * 4 };
+                        self.emit_op(read_op, 0x01);
+                        self.emit_i32(off);
                         self.emit_u16(sz as u16);
                         self.stack_depth += sz / 4;
                     }
@@ -1215,31 +1833,128 @@ impl<'a> CodeGenerator<'a> {
         let aid = self.arena.get(node.left).clone();
         let func_name = aid.string_data.as_deref().unwrap_or("").to_string();
 
-        // Generate arguments, tracking each one's type for proper stack cleanup
-        let mut arg_count = 0u8;
-        let mut arg_types: Vec<NwType> = Vec::new();
+        // Resolve the function signature first so we can decide on calling convention.
+        let engine_sig = self.find_engine_func(&func_name).map(|(id, s)| (id, s.clone()));
+        let user_sig = self.find_user_func(&func_name).cloned();
+        let sig_opt = engine_sig.as_ref().map(|(_, s)| s.clone()).or_else(|| user_sig.clone());
+        let is_user = engine_sig.is_none() && user_sig.is_some();
+
+        // For user functions, C++ reserves the return slot BEFORE arguments are pushed:
+        //   [RUNSTACK_ADD retval] [arg0] [arg1] ... JSR  →  stack at JSR: [retval][args]
+        // The callee then writes the return value into the retval slot which lives below
+        // all parameters on its stack frame.
+        if is_user {
+            if let Some(sig) = &user_sig {
+                if sig.return_type != NwType::Void {
+                    // C++ AddVariableToStack / AddStructureToStack recurses over
+                    // each field and emits one RUNSTACK_ADD with that field's aux.
+                    // Vector returns use FLOAT aux per slot; user struct returns
+                    // walk the fields. Engine-struct returns use their own aux.
+                    let ret_slots = self.type_size(sig.return_type, &sig.return_type_name) / 4;
+                    let per_slot_aux = match sig.return_type {
+                        NwType::Vector => NwType::Float.auxcode(),
+                        _ => sig.return_type.auxcode(),
+                    };
+                    for _ in 0..ret_slots {
+                        self.emit_op(Opcode::RunstackAdd, per_slot_aux);
+                        self.stack_depth += 1;
+                    }
+                }
+            }
+        }
+
+        // Collect the provided argument expressions (declaration order).
+        let mut provided: Vec<NodeId> = Vec::new();
         let mut arg_node = aid.right;
         while arg_node != NULL_NODE {
             let arg = self.arena.get(arg_node).clone();
-            if arg.left != NULL_NODE {
-                let t = self.generate_expr(arg.left)?;
-                arg_types.push(t);
-                arg_count += 1;
-            }
+            if arg.left != NULL_NODE { provided.push(arg.left); }
             arg_node = arg.right;
         }
 
-        let arg_byte_size: i32 = arg_types.iter()
-            .map(|t| self.type_size(*t, &None))
-            .sum();
-        let arg_slot_count: i32 = arg_byte_size / 4;
+        // Per-parameter info (cloned out of the owned signature to avoid borrow conflicts).
+        let params_info: Vec<(NwType, Option<String>, Option<crate::semcheck::DefaultValue>)> =
+            sig_opt.as_ref()
+                .map(|s| s.params.iter()
+                    .map(|p| (p.nw_type, p.type_name.clone(), p.default_value.clone()))
+                    .collect())
+                .unwrap_or_default();
 
-        // Check if it's an engine function
-        if let Some((action_id, sig)) = self.find_engine_func(&func_name).map(|(id, s)| (id, s.clone())) {
+        // Total args actually passed = provided + trailing defaults.
+        let declared = params_info.len();
+        let mut total = provided.len();
+        if !params_info.is_empty() {
+            while total < declared {
+                let has_default = sig_opt.as_ref().unwrap().params[total].has_default;
+                if !has_default { break; }
+                total += 1;
+            }
+        }
+
+        // Emission order: ENGINE (EXECUTE_COMMAND) calls push args right-to-left so the
+        // FIRST declared parameter ends on TOP of the stack — the NWScript engine ABI
+        // (the command handler pops the first parameter first). User/unknown calls keep
+        // forward order (Rust assigns user-function parameter offsets to match a forward
+        // push, so user calls are self-consistent either way).
+        let is_engine = engine_sig.is_some();
+        let order: Vec<usize> = if is_engine {
+            (0..total).rev().collect()
+        } else {
+            (0..total).collect()
+        };
+
+        // arg_types indexed by parameter position (order-independent sum below).
+        let mut arg_types: Vec<NwType> = vec![NwType::Void; total];
+        for &i in &order {
+            let is_action = params_info.get(i).map(|p| p.0 == NwType::Action).unwrap_or(false);
+            let t = if i < provided.len() {
+                let node = provided[i];
+                if is_action {
+                    // STORE_STATE per scriptcompfinalcode.cpp:1637-1647 (aux 0x10,
+                    // word1 = global size, word2 = local stack bytes) + JMP-over-body.
+                    self.emit_op(Opcode::StoreState, 0x10);
+                    self.emit_i32(self.global_var_size);
+                    self.emit_i32(self.stack_depth * 4);
+                    let jmp_over = self.emit_jmp_placeholder(Opcode::Jmp);
+                    self.generate_expr(node)?;
+                    self.emit_op(Opcode::Ret, 0);
+                    self.patch_jmp_here(jmp_over);
+                    NwType::Action
+                } else {
+                    self.generate_expr(node)?
+                }
+            } else {
+                // Trailing default value for parameter i.
+                let (pt, ptn, dv) = params_info[i].clone();
+                match dv {
+                    Some(crate::semcheck::DefaultValue::EngineStruct) | None => {
+                        self.emit_default_constant(pt, &ptn);
+                    }
+                    Some(d) => self.emit_default_value_from(&d),
+                }
+                pt
+            };
+            arg_types[i] = t;
+        }
+        let arg_count = total as u8;
+
+        // Action-typed arguments push no runtime value (STORE_STATE handles them),
+        // so they contribute 0 to the SP cleanup C++ performs after the call.
+        let arg_byte_size: i32 = (0..arg_types.len())
+            .map(|i| {
+                let t = arg_types[i];
+                if t == NwType::Action { return 0; }
+                let tn = params_info.get(i).and_then(|p| p.1.clone());
+                self.type_size(t, &tn)
+            })
+            .sum::<i32>();
+
+        // Engine function
+        if let Some((action_id, sig)) = engine_sig {
             self.emit_op(Opcode::ExecuteCommand, 0);
             self.emit_u16(action_id);
             self.emit(arg_count);
-            self.stack_depth -= arg_slot_count;
+            self.stack_depth -= arg_byte_size / 4;
             if sig.return_type != NwType::Void {
                 let ret_slots = self.type_size(sig.return_type, &sig.return_type_name) / 4;
                 self.stack_depth += ret_slots;
@@ -1247,22 +1962,13 @@ impl<'a> CodeGenerator<'a> {
             return Ok(sig.return_type);
         }
 
-        // User-defined function
-        if let Some(sig) = self.find_user_func(&func_name).cloned() {
-            // Reserve return value space if non-void
-            if sig.return_type != NwType::Void {
-                let ret_slots = self.type_size(sig.return_type, &sig.return_type_name) / 4;
-                for _ in 0..ret_slots {
-                    self.emit_op(Opcode::RunstackAdd, sig.return_type.auxcode());
-                    self.stack_depth += 1;
-                }
-            }
-
+        // User-defined function: arguments and return slot were both already pushed.
+        if let Some(sig) = user_sig {
             self.emit_jsr_label(&func_name);
-
-            // Clean up arguments using actual sizes
+            // Pop the arguments — the return value remains at the top of the stack.
             if arg_byte_size > 0 {
                 self.emit_modify_sp(-arg_byte_size);
+                self.stack_depth -= arg_byte_size / 4;
             }
             return Ok(sig.return_type);
         }
@@ -1271,95 +1977,252 @@ impl<'a> CodeGenerator<'a> {
         self.emit_op(Opcode::ExecuteCommand, 0);
         self.emit_u16(0);
         self.emit(arg_count);
-        self.stack_depth -= arg_slot_count;
+        self.stack_depth -= arg_byte_size / 4;
         Ok(NwType::Void)
+    }
+
+    fn emit_default_constant(&mut self, nw_type: NwType, _type_name: &Option<String>) {
+        match nw_type {
+            NwType::Integer => self.emit_const_int(0),
+            NwType::Float => self.emit_const_float(0.0),
+            NwType::String => self.emit_const_string(""),
+            NwType::Object => self.emit_const_object(1), // OBJECT_INVALID
+            NwType::Vector => {
+                self.emit_const_float(0.0);
+                self.emit_const_float(0.0);
+                self.emit_const_float(0.0);
+            }
+            // C++ scriptcompfinalcode.cpp:1936-2010 emits the engine-struct-specific
+            // CONSTANT for omitted defaults: aux = 0x10+n; json has u16-prefixed payload.
+            NwType::EngineStructure(2) => {
+                // location: CONSTANT aux=0x12 + 4-byte i32 0
+                self.emit_op(Opcode::Constant, 0x12);
+                self.emit_i32(0);
+                self.stack_depth += 1;
+            }
+            NwType::EngineStructure(7) => {
+                // json: CONSTANT aux=0x17 + u16 length + bytes
+                self.emit_op(Opcode::Constant, 0x17);
+                self.emit_str("");
+                self.stack_depth += 1;
+            }
+            NwType::EngineStructure(n) => {
+                // Other engine structs don't legally have defaults (validated in
+                // semcheck), but stay consistent if reached.
+                self.emit_op(Opcode::Constant, 0x10 + n);
+                self.emit_i32(0);
+                self.stack_depth += 1;
+            }
+            _ => self.emit_const_int(0),
+        }
+    }
+
+    fn emit_default_value_from(&mut self, dv: &crate::semcheck::DefaultValue) {
+        use crate::semcheck::DefaultValue as DV;
+        match dv {
+            DV::Integer(v) => self.emit_const_int(*v),
+            DV::Float(v) => self.emit_const_float(*v),
+            DV::String(s) => self.emit_const_string(s),
+            DV::Object(v) => self.emit_const_object(*v),
+            DV::Vector(x, y, z) => {
+                self.emit_const_float(*x);
+                self.emit_const_float(*y);
+                self.emit_const_float(*z);
+            }
+            // C++ emits the engine-struct CONSTANT with its specific aux code.
+            // We don't know which engine struct here because the DefaultValue enum
+            // doesn't carry the index; emit a generic ENGST0 placeholder.
+            DV::EngineStruct => {
+                self.emit_op(Opcode::Constant, 0x10);
+                self.emit_i32(0);
+                self.stack_depth += 1;
+            }
+        }
     }
 
     fn gen_struct_field_read(&mut self, node_id: NodeId) -> Result<NwType, CompileError> {
-        let node = self.arena.get(node_id).clone();
-        let field_name = node.string_data.as_deref().unwrap_or("");
+        let (_t, _n) = self.gen_struct_field_read_typed(node_id)?;
+        Ok(_t)
+    }
 
-        // Generate the struct value onto the stack
-        let struct_type = self.generate_expr(node.left)?;
+    /// Returns (resulting type, struct-name if the result is a Struct).
+    /// Carrying the struct name avoids relying on `type_name` being populated on
+    /// chained `StructurePart` nodes (the parser only sets it on `Variable`).
+    fn gen_struct_field_read_typed(
+        &mut self,
+        node_id: NodeId,
+    ) -> Result<(NwType, Option<String>), CompileError> {
+        // This helper self-recurses one frame per `.field` in a chain, bypassing the
+        // generate_expr depth guard. Count it on the same expr_depth so a pathological
+        // `v.a.a.a...(thousands).x` chain returns cleanly instead of overflowing.
+        self.expr_depth += 1;
+        if self.expr_depth > 2000 {
+            self.expr_depth -= 1;
+            return Err(CompileError::UnexpectedCharacter);
+        }
+        let r = self.gen_struct_field_read_typed_inner(node_id);
+        self.expr_depth -= 1;
+        r
+    }
+
+    fn gen_struct_field_read_typed_inner(
+        &mut self,
+        node_id: NodeId,
+    ) -> Result<(NwType, Option<String>), CompileError> {
+        let node = self.arena.get(node_id).clone();
+        let field_name = node.string_data.as_deref().unwrap_or("").to_string();
+
+        // Generate the struct value onto the stack and discover its struct name.
+        let (struct_type, struct_name) = if node.left != NULL_NODE {
+            let left = self.arena.get(node.left).clone();
+            if left.op == Operation::StructurePart {
+                let (t, n) = self.gen_struct_field_read_typed(node.left)?;
+                (t, n)
+            } else {
+                let t = self.generate_expr(node.left)?;
+                // The parser doesn't populate type_name on Variable / call nodes;
+                // resolve via the runtime symbol tables.
+                let n = match left.op {
+                    Operation::Variable => {
+                        let name = left.string_data.as_deref().unwrap_or("");
+                        self.find_var(name).and_then(|(_, _, _, tn, _)| tn)
+                    }
+                    Operation::Action => {
+                        let aid = if left.left != NULL_NODE {
+                            self.arena.get(left.left).clone()
+                        } else { return Ok((NwType::Void, None)); };
+                        let fname = aid.string_data.as_deref().unwrap_or("");
+                        self.func_sigs.iter()
+                            .find(|f| f.name == fname)
+                            .and_then(|f| f.return_type_name.clone())
+                    }
+                    _ => left.type_name.clone(),
+                };
+                (t, n)
+            }
+        } else {
+            (NwType::Void, None)
+        };
 
         if struct_type == NwType::Vector {
-            // Vector field access: x=0, y=4, z=8
-            let field_offset = match field_name {
+            let field_offset = match field_name.as_str() {
                 "x" => 0i32,
                 "y" => 4,
                 "z" => 8,
-                _ => return Ok(NwType::Void),
+                _ => return Ok((NwType::Void, None)),
             };
-            // DE_STRUCT: extract one float from the 12-byte vector
-            self.emit_op(Opcode::DeStruct, 0);
-            self.emit_i32(4);  // size to keep
-            self.emit_i32(field_offset); // offset of field
-            self.emit_i32(12); // total struct size
-            self.stack_depth -= 2; // remove 3 slots, add 1
-            return Ok(NwType::Float);
+            self.emit_op(Opcode::DeStruct, 0x01);
+            self.emit_u16(12);
+            self.emit_u16(field_offset as u16);
+            self.emit_u16(4);
+            self.stack_depth -= 2;
+            return Ok((NwType::Float, None));
         }
 
-        // Struct field access
         if struct_type == NwType::Struct {
-            if let Some(lhs_node) = self.arena.try_get(node.left) {
-                let type_name = lhs_node.type_name.as_deref().unwrap_or("");
-                if let Some((field_off, field_sz, field_type)) = self.struct_field_offset(type_name, field_name) {
-                    let struct_sz = self.struct_size(type_name);
-                    self.emit_op(Opcode::DeStruct, 0);
-                    self.emit_i32(field_sz);
-                    self.emit_i32(field_off);
-                    self.emit_i32(struct_sz);
-                    self.stack_depth -= (struct_sz / 4) - (field_sz / 4);
-                    return Ok(field_type);
-                }
+            let type_name = struct_name.as_deref().unwrap_or("");
+            if let Some((field_off, field_sz, field_type)) = self.struct_field_offset(type_name, &field_name) {
+                let struct_sz = self.struct_size(type_name);
+                self.emit_op(Opcode::DeStruct, 0x01);
+                self.emit_u16(struct_sz as u16);
+                self.emit_u16(field_off as u16);
+                self.emit_u16(field_sz as u16);
+                self.stack_depth -= (struct_sz / 4) - (field_sz / 4);
+                // If the field is itself a struct, look up its type_name from the
+                // current struct definition so chained reads can continue.
+                let inner_name = if field_type == NwType::Struct {
+                    self.struct_defs.iter()
+                        .find(|s| s.name == type_name)
+                        .and_then(|s| s.fields.iter().find(|f| f.name == field_name))
+                        .and_then(|f| f.type_name.clone())
+                } else {
+                    None
+                };
+                return Ok((field_type, inner_name));
             }
         }
 
-        Ok(NwType::Void)
+        Ok((NwType::Void, None))
     }
 
     fn gen_struct_field_assign(&mut self, lhs: &crate::ast::AstNode) -> Result<(), CompileError> {
-        // lhs is a StructurePart node: lhs.left = struct expression, lhs.string_data = field name
+        // lhs is a StructurePart node: lhs.left = struct expression, lhs.string_data = field name.
         // The new value is already pushed on the stack by the caller.
+        // Walk chained .field references down to the root Variable, summing offsets.
         let field_name = lhs.string_data.as_deref().unwrap_or("");
         if lhs.left == NULL_NODE { return Ok(()); }
 
-        let target = self.arena.get(lhs.left).clone();
-        if target.op != Operation::Variable {
-            return Ok(()); // chained field assignment not yet supported
+        // Build the field path from outer to inner: [(field_name)] for each StructurePart,
+        // then the root Variable.
+        let mut path: Vec<String> = vec![field_name.to_string()];
+        let mut node_id = lhs.left;
+        loop {
+            let n = self.arena.get(node_id).clone();
+            match n.op {
+                Operation::StructurePart => {
+                    path.push(n.string_data.as_deref().unwrap_or("").to_string());
+                    if n.left == NULL_NODE { return Ok(()); }
+                    node_id = n.left;
+                }
+                Operation::Variable => break,
+                _ => return Ok(()), // unsupported lvalue
+            }
         }
 
-        let var_name = target.string_data.as_deref().unwrap_or("");
-        let (so, _struct_sz, _, type_name) = match self.find_local(var_name) {
+        let root = self.arena.get(node_id).clone();
+        let var_name = root.string_data.as_deref().unwrap_or("");
+        let (so, _struct_sz, _, type_name, is_global) = match self.find_var(var_name) {
             Some(v) => v,
             None => return Ok(()),
         };
 
-        // Determine field offset and size
-        let (field_off, field_sz) = if let Some(tn) = &type_name {
-            if let Some((off, sz, _)) = self.struct_field_offset(tn, field_name) {
-                (off, sz)
+        // Resolve each nested field, accumulating offset and tracking current container type
+        let mut cur_type_name = type_name.clone();
+        let mut cur_offset = 0i32;
+        let mut cur_size = 4i32;
+        // path is outer-to-inner; we need inner-to-outer to walk from root → leaf.
+        for field in path.iter().rev() {
+            if let Some(tn) = &cur_type_name {
+                if let Some((off, sz, ftype)) = self.struct_field_offset(tn, field) {
+                    cur_offset += off;
+                    cur_size = sz;
+                    cur_type_name = if ftype == NwType::Struct {
+                        // Look up the field's struct name via the struct definition
+                        self.struct_defs.iter()
+                            .find(|s| s.name == *tn)
+                            .and_then(|s| s.fields.iter().find(|f| f.name == *field))
+                            .and_then(|f| f.type_name.clone())
+                    } else {
+                        None
+                    };
+                } else {
+                    return Ok(());
+                }
             } else {
-                return Ok(());
+                // Vector (no type_name): only valid as innermost
+                let (off, sz) = match field.as_str() {
+                    "x" => (0i32, 4i32),
+                    "y" => (4, 4),
+                    "z" => (8, 4),
+                    _ => return Ok(()),
+                };
+                cur_offset += off;
+                cur_size = sz;
+                cur_type_name = None;
             }
-        } else {
-            // Vector: x=0/4, y=4/4, z=8/4
-            match field_name {
-                "x" => (0i32, 4i32),
-                "y" => (4, 4),
-                "z" => (8, 4),
-                _ => return Ok(()),
-            }
-        };
+        }
 
-        // ASSIGNMENT instruction:
-        // - offset is relative to current SP, pointing to the field location
-        //   struct base is at `so`, field is at `so + field_off`
-        // - the value to assign is on top of stack
-        let target_offset = so + field_off - self.stack_depth * 4;
-        self.emit_op(Opcode::Assignment, 0);
-        self.emit_i32(target_offset);
-        self.emit_u16(field_sz as u16);
+        if is_global {
+            let bp_offset = so + cur_offset - self.global_var_size;
+            self.emit_op(Opcode::AssignmentBase, 0x01);
+            self.emit_i32(bp_offset);
+            self.emit_u16(cur_size as u16);
+        } else {
+            let target_offset = so + cur_offset - self.stack_depth * 4;
+            self.emit_op(Opcode::Assignment, 0x01);
+            self.emit_i32(target_offset);
+            self.emit_u16(cur_size as u16);
+        }
         Ok(())
     }
 }
@@ -1504,9 +2367,11 @@ mod tests {
     }
 
     #[test]
-    fn test_logical_and_short_circuit() {
+    fn test_logical_and_opcode() {
+        // C++ NWScript emits LogicalAnd (0x06) for && — the result is normalised to 0/1
+        // rather than short-circuited via JZ.
         let ncs = compile_to_ncs("void main() { int x = 1 && 0; }");
-        assert!(ncs.contains(&(Opcode::Jz as u8)));
+        assert!(ncs.contains(&(Opcode::LogicalAnd as u8)));
     }
 
     #[test]

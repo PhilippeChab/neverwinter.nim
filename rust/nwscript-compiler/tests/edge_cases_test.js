@@ -70,7 +70,8 @@ expectOk('case fall-through', 'void main() { switch(1) { case 1: case 2: break; 
 console.log('\n=== For loop edge cases ===');
 expectOk('for with empty everything', 'void main() { for (;;) { break; } }');
 expectOk('for with only condition', 'void main() { int i = 0; for (; i < 10; ) { i++; } }');
-expectOk('for declaring loop var', 'void main() { for (int i = 0; i < 10; i++) {} }');
+// C++ NWScript does NOT allow declarations in for-init; this rejects per C++ grammar.
+expectError('for declaring loop var (C++ rejects)', 'void main() { for (int i = 0; i < 10; i++) {} }', 'bad start');
 
 console.log('\n=== Operator edge cases ===');
 expectOk('chained comparisons via &&', 'void main() { int x = 5; if (x > 0 && x < 10) {} }');
@@ -81,7 +82,9 @@ expectOk('void in param list', 'void f();');
 expectError('function param shadowing', 'void f(int x, int x) { }', null);
 
 console.log('\n=== Include edge cases ===');
-// Test self-include (file includes itself)
+// A file that #includes ITSELF is silently deduplicated by the C++ compiler
+// (the main file's own resref is registered before includes resolve), so it must
+// compile cleanly with no error — not be flagged as recursive.
 {
     const c = new WasmCompiler();
     c.setRequireEntryPoint(false);
@@ -92,8 +95,8 @@ console.log('\n=== Include edge cases ===');
     const errs = [];
     for (let i = 0; i < n; i++) errs.push(c.getCollectedError(i));
     c.free();
-    if (n > 0) { pass++; console.log('✓ self-include detected'); }
-    else { fail++; console.log('✗ self-include — no error'); failures.push({name: 'self-include'}); }
+    if (n === 0) { pass++; console.log('✓ self-include deduplicated (matches C++)'); }
+    else { fail++; console.log('✗ self-include — spurious error:', errs[0]); failures.push({name: 'self-include'}); }
 }
 
 console.log(`\n=== ${pass + fail} tests: ${pass} passed, ${fail} failed ===`);

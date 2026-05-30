@@ -50,8 +50,64 @@ pub fn ast_to_json(arena: &AstArena, root: NodeId) -> AstJson {
     }
 }
 
+/// Cap on the emitted JSON nesting depth (both left-descent and right-spine length).
+/// Two reasons: (1) `make_node_json` still recurses into `left` (deep field chains /
+/// operator spines would overflow the build), and (2) `serde_json` serializes the
+/// resulting `left`/`right` Box tree RECURSIVELY, so a deep structure overflows the
+/// 1 MB WASM stack during serialization even though we build the right spine
+/// iteratively. Beyond the cap we emit a single "(truncated)" placeholder. Real LSP
+/// files are far shallower than this; only pathological or spec-sized input truncates.
+const MAX_JSON_DEPTH: u32 = 1500;
+
 fn node_to_json(arena: &AstArena, node_id: NodeId) -> Option<AstNodeJson> {
+    node_to_json_d(arena, node_id, 0)
+}
+
+fn truncated_marker() -> AstNodeJson {
+    AstNodeJson {
+        operation: "TRUNCATED".to_string(),
+        operation_id: 0,
+        position: AstPosition { file: 0, line: 0, char: 0 },
+        string_data: None,
+        integer_data: None,
+        float_data: None,
+        vector_data: None,
+        type_str: None,
+        type_id: None,
+        type_name: None,
+        stack_pointer: None,
+        left: None,
+        right: None,
+    }
+}
+
+fn node_to_json_d(arena: &AstArena, node_id: NodeId, depth: u32) -> Option<AstNodeJson> {
     if node_id == NULL_NODE { return None; }
+    if depth >= MAX_JSON_DEPTH { return Some(truncated_marker()); }
+    // Build the head node, then walk the right-linked spine ITERATIVELY, recursing
+    // only into each node's `left`. Right spines are the long chains (StatementList,
+    // FunctionalUnit, VariableList). Each right link costs one serde frame, so it
+    // counts against the depth cap alongside left-descent.
+    let mut head = make_node_json(arena, node_id, depth);
+    let mut tail = &mut head;
+    let mut rid = arena.get(node_id).right;
+    let mut d = depth;
+    while rid != NULL_NODE {
+        d += 1;
+        if d >= MAX_JSON_DEPTH {
+            tail.right = Some(Box::new(truncated_marker()));
+            break;
+        }
+        tail.right = Some(Box::new(make_node_json(arena, rid, d)));
+        tail = tail.right.as_mut().unwrap();
+        rid = arena.get(rid).right;
+    }
+    Some(head)
+}
+
+/// Build one node's JSON: own fields + recursive `left`, with `right` left empty
+/// (the caller links the right-spine iteratively).
+fn make_node_json(arena: &AstArena, node_id: NodeId, depth: u32) -> AstNodeJson {
     let node = arena.get(node_id);
 
     let op_name = operation_name(node.op);
@@ -73,7 +129,7 @@ fn node_to_json(arena: &AstArena, node_id: NodeId) -> Option<AstNodeJson> {
 
     let stack_pointer = if node.stack_pointer != 0 { Some(node.stack_pointer) } else { None };
 
-    Some(AstNodeJson {
+    AstNodeJson {
         operation: op_name.to_string(),
         operation_id: op_id,
         position: AstPosition {
@@ -89,9 +145,9 @@ fn node_to_json(arena: &AstArena, node_id: NodeId) -> Option<AstNodeJson> {
         type_id: Some(nwtype_to_id(node.nw_type)),
         type_name: node.type_name.clone(),
         stack_pointer,
-        left: node_to_json(arena, node.left).map(Box::new),
-        right: node_to_json(arena, node.right).map(Box::new),
-    })
+        left: node_to_json_d(arena, node.left, depth + 1).map(Box::new),
+        right: None,
+    }
 }
 
 // ===== Position queries =====
@@ -319,23 +375,27 @@ impl<'a> PositionQuery<'a> {
     }
 
     fn collect_visible_vars(&self, node_id: NodeId, target_line: u32, completions: &mut Vec<CompletionInfo>) {
-        if node_id == NULL_NODE { return; }
-        let node = self.arena.get(node_id);
-
-        if node.op == Operation::Variable && node.string_data.is_some() && node.line <= target_line {
-            if let Some(name) = &node.string_data {
-                if !completions.iter().any(|c| c.name == *name) {
-                    completions.push(CompletionInfo {
-                        kind: "variable".to_string(),
-                        name: name.clone(),
-                        detail: node.type_name.clone(),
-                    });
+        // Explicit-stack pre-order walk (recursion overflows on long right-linked
+        // chains — ~497 nodes — which is the common LSP-completion case).
+        let mut stack = vec![node_id];
+        while let Some(id) = stack.pop() {
+            if id == NULL_NODE { continue; }
+            let node = self.arena.get(id);
+            if node.op == Operation::Variable && node.string_data.is_some() && node.line <= target_line {
+                if let Some(name) = &node.string_data {
+                    if !completions.iter().any(|c| c.name == *name) {
+                        completions.push(CompletionInfo {
+                            kind: "variable".to_string(),
+                            name: name.clone(),
+                            detail: node.type_name.clone(),
+                        });
+                    }
                 }
             }
+            // Push right then left so left is processed first (pre-order).
+            if node.right != NULL_NODE { stack.push(node.right); }
+            if node.left != NULL_NODE { stack.push(node.left); }
         }
-
-        if node.left != NULL_NODE { self.collect_visible_vars(node.left, target_line, completions); }
-        if node.right != NULL_NODE { self.collect_visible_vars(node.right, target_line, completions); }
     }
 
     fn find_ancestor_action(&self, line: u32, col: u32) -> Option<NodeId> {
@@ -348,26 +408,33 @@ impl<'a> PositionQuery<'a> {
     }
 
     fn find_action_containing(&self, node_id: NodeId, line: u32, col: u32, result: &mut Option<NodeId>) {
-        if node_id == NULL_NODE { return; }
-        let node = self.arena.get(node_id);
-
-        if node.op == Operation::Action {
-            // Check if position is roughly within this action's scope
-            if node.line <= line {
-                *result = Some(node_id);
+        let _ = col;
+        // Explicit-stack pre-order walk. The result is the last pre-order Action with
+        // line <= target — identical to the recursive node/left/right order.
+        let mut stack = vec![node_id];
+        while let Some(id) = stack.pop() {
+            if id == NULL_NODE { continue; }
+            let node = self.arena.get(id);
+            if node.op == Operation::Action && node.line <= line {
+                *result = Some(id);
             }
+            if node.right != NULL_NODE { stack.push(node.right); }
+            if node.left != NULL_NODE { stack.push(node.left); }
         }
-
-        if node.left != NULL_NODE { self.find_action_containing(node.left, line, col, result); }
-        if node.right != NULL_NODE { self.find_action_containing(node.right, line, col, result); }
     }
 
     fn walk(&self, node_id: NodeId, depth: u32, f: &mut impl FnMut(&AstNode, u32)) {
-        if node_id == NULL_NODE { return; }
-        let node = self.arena.get(node_id);
-        f(node, depth);
-        self.walk(node.left, depth + 1, f);
-        self.walk(node.right, depth + 1, f);
+        // Explicit-stack pre-order walk preserving per-node depth (the position-query
+        // tie-breaker depends on it). Recursion overflowed on long right-spines.
+        let mut stack: Vec<(NodeId, u32)> = vec![(node_id, depth)];
+        while let Some((id, d)) = stack.pop() {
+            if id == NULL_NODE { continue; }
+            let node = self.arena.get(id);
+            f(node, d);
+            // Push right then left so left is visited first (matches node/left/right).
+            if node.right != NULL_NODE { stack.push((node.right, d + 1)); }
+            if node.left != NULL_NODE { stack.push((node.left, d + 1)); }
+        }
     }
 }
 

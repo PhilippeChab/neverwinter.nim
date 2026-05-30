@@ -1,8 +1,14 @@
 use std::fmt::Write;
 
 /// Type abbreviations used in NDB output, matching GenerateDebuggerTypeAbbreviation
-/// in the C++ compiler.
-fn type_abbrev(nw_type: crate::types::NwType, struct_name: &str) -> String {
+/// in the C++ compiler (scriptcompfinalcode.cpp:6747-6803).
+/// `struct_index_of` resolves a struct name to its index in the struct table, used to
+/// emit Struct (and the vector pseudo-struct) as `tNNNN`.
+fn type_abbrev(
+    nw_type: crate::types::NwType,
+    struct_name: &str,
+    struct_index_of: &dyn Fn(&str) -> Option<usize>,
+) -> String {
     use crate::types::NwType;
     match nw_type {
         NwType::Void => "v".to_string(),
@@ -10,10 +16,18 @@ fn type_abbrev(nw_type: crate::types::NwType, struct_name: &str) -> String {
         NwType::Float => "f".to_string(),
         NwType::String => "s".to_string(),
         NwType::Object => "o".to_string(),
-        NwType::Vector => "vec".to_string(),
-        NwType::Action => "v".to_string(),
+        // C++ models vector as a struct; emit it via the struct table.
+        NwType::Vector => match struct_index_of("vector") {
+            Some(i) => format!("t{:04}", i),
+            None => "t0000".to_string(),
+        },
+        // C++ falls through to "?".
+        NwType::Action => "?".to_string(),
         NwType::EngineStructure(n) => format!("e{}", n),
-        NwType::Struct => format!("struct {}", struct_name),
+        NwType::Struct => match struct_index_of(struct_name) {
+            Some(i) => format!("t{:04}", i),
+            None => format!("t0000"),
+        },
     }
 }
 
@@ -116,11 +130,14 @@ impl NdbBuilder {
             writeln!(out, "{}{:02} {}", prefix, i, name).unwrap();
         }
 
+        // Build a name→index lookup so type_abbrev can emit struct/vector as tNNNN.
+        let struct_lookup = |n: &str| self.structs.iter().position(|s| s.name == n);
+
         // Struct entries: "s %02d %s\n" then "sf <type> <name>\n" per field
         for s in &self.structs {
             writeln!(out, "s {:02} {}", s.fields.len(), s.name).unwrap();
             for (fname, ftype, fstruct) in &s.fields {
-                writeln!(out, "sf {} {}", type_abbrev(*ftype, fstruct), fname).unwrap();
+                writeln!(out, "sf {} {}", type_abbrev(*ftype, fstruct, &struct_lookup), fname).unwrap();
             }
         }
 
@@ -132,11 +149,11 @@ impl NdbBuilder {
                 f.code_start,
                 f.code_end,
                 f.params.len(),
-                type_abbrev(f.return_type, &f.return_struct_name),
+                type_abbrev(f.return_type, &f.return_struct_name, &struct_lookup),
                 f.name,
             ).unwrap();
             for (ptype, pstruct) in &f.params {
-                writeln!(out, "fp {}", type_abbrev(*ptype, pstruct)).unwrap();
+                writeln!(out, "fp {}", type_abbrev(*ptype, pstruct, &struct_lookup)).unwrap();
             }
         }
 
@@ -148,16 +165,17 @@ impl NdbBuilder {
                 v.code_start,
                 v.code_end,
                 v.stack_loc,
-                type_abbrev(v.var_type, &v.struct_name),
+                type_abbrev(v.var_type, &v.struct_name, &struct_lookup),
                 v.name,
             ).unwrap();
         }
 
-        // Line number entries: "l %02d %08x %08x %08x\n" (file_id, line, code_start, code_end)
+        // C++ scriptcompfinalcode.cpp:6980 — "l%02d %07d %08x %08x\n"
+        // (no space after l; 7-digit decimal line number)
         for l in &self.line_entries {
             writeln!(
                 out,
-                "l {:02} {:08x} {:08x} {:08x}",
+                "l{:02} {:07} {:08x} {:08x}",
                 l.file_id, l.line, l.code_start, l.code_end,
             ).unwrap();
         }
@@ -239,6 +257,7 @@ mod tests {
             code_end: 0x13,
         });
         let s = String::from_utf8(b.generate()).unwrap();
-        assert!(s.contains("l 00 00000005 0000000d 00000013"));
+        // C++ format: "l%02d %07d %08x %08x"
+        assert!(s.contains("l00 0000005 0000000d 00000013"));
     }
 }

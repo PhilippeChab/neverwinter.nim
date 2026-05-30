@@ -79,8 +79,10 @@ impl WasmCompiler {
         let source = match self.files.get(filename) {
             Some(s) => s.clone(),
             None => {
+                // C++ scriptcompcore.cpp:1508-1511 omits the parenthesized line
+                // number when the line is 0 (`%s.nss: %s`).
                 self.last_error = format!(
-                    "{}.nss(0): ERROR: File not found: {}",
+                    "{}.nss: ERROR: File not found: {}",
                     filename, filename
                 );
                 self.last_diagnostics.clear();

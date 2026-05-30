@@ -159,7 +159,13 @@ impl<'a> Lexer<'a> {
             }
             if ch == b'"' {
                 self.advance();
-                return Some((String::from_utf8_lossy(&buf).into_owned(), TokenType::String));
+                // C++ preserves every byte (including \xAB and other bytes >= 0x80)
+                // verbatim in the token payload. `from_utf8_lossy` would replace
+                // invalid sequences with U+FFFD and inflate `\xAB` to a 3-byte UTF-8
+                // sequence — breaking codegen and hashed-string parity. The buffer
+                // is only consumed via `.as_bytes()` downstream, so this is safe.
+                let s = unsafe { String::from_utf8_unchecked(buf) };
+                return Some((s, TokenType::String));
             }
             if ch == b'\\' {
                 self.advance();
@@ -173,16 +179,51 @@ impl<'a> Lexer<'a> {
                     b'\\' => buf.push(b'\\'),
                     b'"' => buf.push(b'"'),
                     b'x' => {
+                        // C++ requires at least 2 chars after \x or unterminated string.
+                        // The parse itself is strtol-lenient: bad hex digits accumulate
+                        // a partial result (e.g. \x1G → 0x01, \xGZ → 0x00) and the byte
+                        // is still emitted.
+                        if self.pos + 2 > self.source.len() {
+                            self.error(CompileError::UnterminatedStringConstant);
+                            return None;
+                        }
                         let h1 = self.advance();
                         let h2 = self.advance();
-                        let hex_str =
-                            String::from_utf8_lossy(&[h1, h2]).into_owned();
-                        if let Ok(val) = u8::from_str_radix(&hex_str, 16) {
-                            buf.push(val);
-                        }
+                        let to_hex = |c: u8| -> Option<u8> {
+                            match c {
+                                b'0'..=b'9' => Some(c - b'0'),
+                                b'a'..=b'f' => Some(c - b'a' + 10),
+                                b'A'..=b'F' => Some(c - b'A' + 10),
+                                _ => None,
+                            }
+                        };
+                        // C++ calls strtol on the 2-char window, which accepts a
+                        // leading +/- sign (e.g. "\x-5" → strtol("-5",16) = -5 → 0xFB).
+                        let val: u8 = if h1 == b'-' || h1 == b'+' {
+                            let mag = to_hex(h2).unwrap_or(0) as i32;
+                            let signed = if h1 == b'-' { -mag } else { mag };
+                            signed as u8
+                        } else {
+                            // strtol stops at the first non-hex char: an invalid first
+                            // nibble converts nothing (\xG1 -> 0), and a valid first with
+                            // invalid second yields just the first nibble (\x1G -> 1).
+                            match to_hex(h1) {
+                                None => 0,
+                                Some(d1) => match to_hex(h2) {
+                                    Some(d2) => (d1 << 4) | d2,
+                                    None => d1,
+                                },
+                            }
+                        };
+                        buf.push(val);
+                    }
+                    b'\n' => {
+                        // C++: `\` followed immediately by newline → unterminated string
+                        self.error(CompileError::UnterminatedStringConstant);
+                        return None;
                     }
                     other => {
-                        buf.push(b'\\');
+                        // C++: unknown escape — drop the backslash, keep only the next char
                         buf.push(other);
                     }
                 }
@@ -206,10 +247,8 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     buf.push(b'"');
                 } else {
-                    return Some((
-                        String::from_utf8_lossy(&buf).into_owned(),
-                        TokenType::String,
-                    ));
+                    let s = unsafe { String::from_utf8_unchecked(buf) };
+                    return Some((s, TokenType::String));
                 }
             } else {
                 buf.push(self.advance());
@@ -218,21 +257,12 @@ impl<'a> Lexer<'a> {
     }
 
     fn read_hashed_string(&mut self) -> Option<(String, TokenType)> {
-        let mut buf = Vec::new();
-        loop {
-            if self.at_end() || self.peek() == b'\n' {
-                self.error(CompileError::UnterminatedStringConstant);
-                return None;
-            }
-            let ch = self.peek();
-            if ch == b'"' {
-                self.advance();
-                let s = String::from_utf8_lossy(&buf).into_owned();
-                let hash = exo_hash(&s);
-                return Some((format!("0x{hash:x}"), TokenType::HexInteger));
-            }
-            buf.push(self.advance());
-        }
+        // C++ NWScript routes both TOKEN_STRING and TOKEN_HASHED_STRING through the
+        // same ParseStringCharacter (scriptcomplexical.cpp:595-651). Reuse read_string
+        // so escape handling stays consistent, then hash the result with CExoString::GetHash.
+        let (s, _tt) = self.read_string()?;
+        let hash = crate::xxh32::cexo_string_hash(&s);
+        Some((format!("0x{:x}", hash as u32), TokenType::HexInteger))
     }
 
     fn read_number(&mut self, first: u8) -> Token {
@@ -247,6 +277,11 @@ impl<'a> Lexer<'a> {
                 while !self.at_end() && is_hex_digit(self.peek()) {
                     buf.push(self.advance());
                 }
+                // C++: after `0x`, any letter that is not a hex digit is
+                // ERROR_UNEXPECTED_CHARACTER (scriptcomplexical.cpp:287-319).
+                if !self.at_end() && self.peek().is_ascii_alphabetic() {
+                    self.error(CompileError::UnexpectedCharacter);
+                }
                 return Token::new(
                     TokenType::HexInteger,
                     String::from_utf8_lossy(&buf).into_owned(),
@@ -260,6 +295,11 @@ impl<'a> Lexer<'a> {
                 while !self.at_end() && (self.peek() == b'0' || self.peek() == b'1') {
                     buf.push(self.advance());
                 }
+                // C++ errors on any non-binary letter/digit immediately after a
+                // binary integer prefix (scriptcomplexical.cpp:147-167).
+                if !self.at_end() && (self.peek().is_ascii_alphanumeric()) {
+                    self.error(CompileError::UnexpectedCharacter);
+                }
                 return Token::new(
                     TokenType::BinaryInteger,
                     String::from_utf8_lossy(&buf).into_owned(),
@@ -272,6 +312,9 @@ impl<'a> Lexer<'a> {
                 buf.push(self.advance());
                 while !self.at_end() && self.peek() >= b'0' && self.peek() <= b'7' {
                     buf.push(self.advance());
+                }
+                if !self.at_end() && (self.peek().is_ascii_alphanumeric()) {
+                    self.error(CompileError::UnexpectedCharacter);
                 }
                 return Token::new(
                     TokenType::OctalInteger,
@@ -287,13 +330,17 @@ impl<'a> Lexer<'a> {
         while !self.at_end() && (self.peek().is_ascii_digit() || self.peek() == b'.') {
             if self.peek() == b'.' {
                 if is_float {
+                    // C++: second '.' in FLOAT state → UnexpectedCharacter
+                    self.advance();
+                    self.error(CompileError::UnexpectedCharacter);
                     break;
                 }
                 is_float = true;
             }
             buf.push(self.advance());
         }
-        if !self.at_end() && (self.peek() == b'f' || self.peek() == b'F') {
+        // C++ accepts only lowercase 'f' as the float suffix (scriptcomplexical.cpp:1691).
+        if !self.at_end() && self.peek() == b'f' {
             is_float = true;
             self.advance();
         }
@@ -571,14 +618,14 @@ impl<'a> Lexer<'a> {
                 }
 
                 ch if is_ident_start(ch) => {
-                    if ch == b'r' && self.peek() == b'"' {
+                    if (ch == b'r' || ch == b'R') && self.peek() == b'"' {
                         self.advance();
                         if let Some((text, tt)) = self.read_raw_string() {
                             return Token::new(tt, text, start_line, start_col, self.file_id);
                         }
                         continue;
                     }
-                    if ch == b'h' && self.peek() == b'"' {
+                    if (ch == b'h' || ch == b'H') && self.peek() == b'"' {
                         self.advance();
                         if let Some((text, tt)) = self.read_hashed_string() {
                             return Token::new(tt, text, start_line, start_col, self.file_id);
@@ -589,7 +636,10 @@ impl<'a> Lexer<'a> {
                 }
 
                 _ => {
-                    self.error(CompileError::UnexpectedCharacter);
+                    // C++ scriptcomplexical.cpp:1607-1847 silently drops any byte it
+                    // doesn't explicitly handle ($, @, `, \, 0x7F, and the UTF-8 BOM
+                    // bytes 0xEF 0xBB 0xBF). Match that — common editors prepend a BOM
+                    // and rejecting it would break LSP compatibility.
                     continue;
                 }
             }
@@ -651,7 +701,7 @@ fn keyword_lookup(word: &str) -> Option<TokenType> {
         "return" => TokenType::KeywordReturn,
         "OBJECT_SELF" => TokenType::KeywordObjectSelf,
         "OBJECT_INVALID" => TokenType::KeywordObjectInvalid,
-        "JsonNull" => TokenType::KeywordJsonNull,
+        // C++ NWScript only recognises the all-uppercase JSON_* literal keywords.
         "JSON_FALSE" => TokenType::KeywordJsonFalse,
         "JSON_TRUE" => TokenType::KeywordJsonTrue,
         "JSON_OBJECT" => TokenType::KeywordJsonObject,

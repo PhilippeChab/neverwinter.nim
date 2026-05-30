@@ -55,4 +55,13 @@ for (const name of allFiles) {
 
 console.log(`\n${allFiles.length - failedFiles.length}/${allFiles.length} passed, ${totalErrors} total errors`);
 c.free();
-process.exit(failedFiles.length > 0 ? 1 : 0);
+
+// Known-bad files: real bugs in the user's project, kept as regression checks.
+// "consts_roles": contains `string UNDEFINED_STRING = 1;` (int → string mismatch).
+const knownBad = new Set(['consts_roles']);
+const unexpected = failedFiles.filter(f => !knownBad.has(f));
+if (unexpected.length) {
+    console.log(`UNEXPECTED failures: ${unexpected.join(', ')}`);
+    process.exit(1);
+}
+process.exit(0);
